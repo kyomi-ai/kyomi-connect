@@ -1,6 +1,6 @@
 [package]
 name = "kyomi-connect"
-version = "0.9.2"
+version = "1.0.0"
 edition = "2024"
 description = "On-premise database agent for Kyomi — connects your data warehouse securely"
 license = "Apache-2.0"
