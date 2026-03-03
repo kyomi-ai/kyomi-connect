@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
 env:
   BINARY_NAME: kyomi-connect
   GHCR_REGISTRY: ghcr.io/kyomi-ai
@@ -127,9 +132,6 @@ jobs:
   publish-crates:
     needs: [build-linux-amd64]
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
       - name: Checkout code
@@ -164,8 +166,6 @@ jobs:
   release:
     needs: [build-linux-amd64, build-linux-arm64, build-macos-arm64, build-macos-amd64, publish-crates]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Download all artifacts
@@ -186,9 +186,6 @@ jobs:
   docker:
     needs: [prepare, release]
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
 
     steps:
       - name: Checkout code
@@ -215,9 +212,6 @@ jobs:
   helm:
     needs: [prepare, release]
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
 
     steps:
       - name: Checkout code
