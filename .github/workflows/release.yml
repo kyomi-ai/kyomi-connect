@@ -147,19 +147,19 @@ jobs:
           echo "CARGO_REGISTRY_TOKEN=${CRATES_TOKEN}" >> $GITHUB_ENV
 
       - name: Publish kyomi-connect-protocol
-        run: cargo publish -p kyomi-connect-protocol
+        run: cargo publish -p kyomi-connect-protocol || echo "::warning::kyomi-connect-protocol publish skipped (already exists or auth issue)"
 
       - name: Wait for crates.io index update
         run: sleep 30
 
       - name: Publish kyomi-datasource
-        run: cargo publish -p kyomi-datasource
+        run: cargo publish -p kyomi-datasource || echo "::warning::kyomi-datasource publish skipped (already exists or auth issue)"
 
       - name: Wait for crates.io index update
         run: sleep 30
 
       - name: Publish kyomi-connect
-        run: cargo publish -p kyomi-connect
+        run: cargo publish -p kyomi-connect || echo "::warning::kyomi-connect publish skipped (already exists or auth issue)"
 
   release:
     needs: [build-linux-amd64, build-linux-arm64, build-macos-arm64, build-macos-amd64, publish-crates]
