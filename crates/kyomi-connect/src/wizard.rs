@@ -72,22 +72,11 @@ pub fn peek_token_safe(token: &str) -> Option<TokenPeek> {
 
 /// Fetch datasource info from the Kyomi API.
 /// Returns `None` on any error (network, auth, deserialization).
-pub async fn fetch_connect_info_safe(
-    base_url: &str,
-    token: &str,
-) -> Option<ConnectInfoResponse> {
-    let url = format!(
-        "{}/api/v1/connect/info",
-        base_url.trim_end_matches('/')
-    );
+pub async fn fetch_connect_info_safe(base_url: &str, token: &str) -> Option<ConnectInfoResponse> {
+    let url = format!("{}/api/v1/connect/info", base_url.trim_end_matches('/'));
 
     let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .ok()?;
+    let resp = client.get(&url).bearer_auth(token).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;
@@ -102,10 +91,7 @@ pub async fn fetch_connect_info_safe(
 
 /// Verify the JWT signature against the JWKS endpoint at `{iss}/.well-known/jwks.json`.
 async fn verify_token_signature(token: &str, iss: &str) -> anyhow::Result<()> {
-    let jwks_url = format!(
-        "{}/.well-known/jwks.json",
-        iss.trim_end_matches('/')
-    );
+    let jwks_url = format!("{}/.well-known/jwks.json", iss.trim_end_matches('/'));
 
     let jwks_response = reqwest::get(&jwks_url)
         .await
@@ -319,6 +305,7 @@ fn resolve_token_manual_paste() -> anyhow::Result<String> {
 ///
 /// All `Option` parameters come from clap CLI args; `None` means the user
 /// didn't pass the flag and we should prompt interactively.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_setup(
     token_arg: Option<String>,
     token_file_arg: Option<String>,
@@ -375,21 +362,25 @@ pub async fn run_setup(
     eprintln!();
     eprint!("  Verifying token... ");
 
-    let peek = peek_token_safe(&token)
-        .ok_or_else(|| anyhow::anyhow!("Invalid token format"))?;
+    let peek = peek_token_safe(&token).ok_or_else(|| anyhow::anyhow!("Invalid token format"))?;
 
     verify_token_signature(&token, &peek.iss).await?;
 
-    let info = fetch_connect_info_safe(&peek.iss, &token).await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not reach Kyomi at {}. Check that the token is valid.",
-            peek.iss
-        )
-    })?;
+    let info = fetch_connect_info_safe(&peek.iss, &token)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not reach Kyomi at {}. Check that the token is valid.",
+                peek.iss
+            )
+        })?;
 
     eprintln!("ok");
     eprintln!();
-    eprintln!("  Datasource:  {} ({})", info.datasource_name, info.datasource_type_label);
+    eprintln!(
+        "  Datasource:  {} ({})",
+        info.datasource_name, info.datasource_type_label
+    );
     eprintln!("  Workspace:   {}", info.workspace_name);
 
     // -----------------------------------------------------------------------
@@ -401,21 +392,22 @@ pub async fn run_setup(
     eprintln!("  Database Connection");
     eprintln!("  ──────────────────");
 
-    let port_default = info
-        .default_port
-        .unwrap_or_else(|| default_port(&peek.db));
+    let port_default = info.default_port.unwrap_or_else(|| default_port(&peek.db));
 
     // Load existing password (for default display)
     let existing_password = existing.as_ref().and_then(|cfg| {
         cfg.db_password_file.as_ref().and_then(|path| {
-            std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
         })
     });
 
     let db_host = match db_host_arg {
         Some(h) => h,
         None if is_interactive => {
-            let default = existing.as_ref()
+            let default = existing
+                .as_ref()
                 .map(|c| c.db_host.clone())
                 .unwrap_or_else(|| "localhost".to_string());
             Input::new()
@@ -423,7 +415,8 @@ pub async fn run_setup(
                 .with_initial_text(&default)
                 .interact_text()?
         }
-        None => existing.as_ref()
+        None => existing
+            .as_ref()
             .map(|c| c.db_host.clone())
             .ok_or_else(|| anyhow::anyhow!("--db-host is required in non-interactive mode"))?,
     };
@@ -431,9 +424,7 @@ pub async fn run_setup(
     let db_port: u16 = match db_port_arg {
         Some(p) => p,
         None if is_interactive => {
-            let default = existing.as_ref()
-                .map(|c| c.db_port)
-                .unwrap_or(port_default);
+            let default = existing.as_ref().map(|c| c.db_port).unwrap_or(port_default);
             Input::new()
                 .with_prompt("  Port")
                 .with_initial_text(default.to_string())
@@ -452,7 +443,8 @@ pub async fn run_setup(
                 .allow_empty(false)
                 .interact_text()?
         }
-        None => existing.as_ref()
+        None => existing
+            .as_ref()
             .map(|c| c.db_name.clone())
             .ok_or_else(|| anyhow::anyhow!("--db-name is required in non-interactive mode"))?,
     };
@@ -467,7 +459,8 @@ pub async fn run_setup(
                 .allow_empty(false)
                 .interact_text()?
         }
-        None => existing.as_ref()
+        None => existing
+            .as_ref()
             .map(|c| c.db_user.clone())
             .ok_or_else(|| anyhow::anyhow!("--db-user is required in non-interactive mode"))?,
     };
@@ -479,7 +472,7 @@ pub async fn run_setup(
             .trim()
             .to_string()
     } else if is_interactive {
-        if existing_password.is_some() {
+        if let Some(existing_pw) = existing_password {
             let keep = Select::new()
                 .with_prompt("  Password")
                 .items(&["Keep current password", "Enter new password"])
@@ -487,7 +480,7 @@ pub async fn run_setup(
                 .interact()
                 .map_err(|e| anyhow::anyhow!("Failed to read selection: {e}"))?;
             if keep == 0 {
-                existing_password.unwrap()
+                existing_pw
             } else {
                 Password::new()
                     .with_prompt("  New password")
@@ -521,7 +514,8 @@ pub async fn run_setup(
                 .iter()
                 .map(|(mode, desc)| format!("{mode} — {desc}"))
                 .collect();
-            let default_idx = existing_ssl.as_ref()
+            let default_idx = existing_ssl
+                .as_ref()
                 .and_then(|m| SSL_OPTIONS.iter().position(|(mode, _)| mode == m))
                 .unwrap_or(0);
             let selection = Select::new()
@@ -542,7 +536,13 @@ pub async fn run_setup(
     eprint!("  Testing database connection... ");
 
     let test_result = test_database_connection(
-        &peek.db, &db_host, db_port, &db_name, &db_user, &db_password, &db_ssl_mode,
+        &peek.db,
+        &db_host,
+        db_port,
+        &db_name,
+        &db_user,
+        &db_password,
+        &db_ssl_mode,
     )
     .await;
 
@@ -555,10 +555,7 @@ pub async fn run_setup(
             eprintln!();
             // Extract the root cause from nested error chains
             let msg = e.to_string();
-            let display_msg = msg
-                .rsplit_once(": ")
-                .map(|(_, root)| root)
-                .unwrap_or(&msg);
+            let display_msg = msg.rsplit_once(": ").map(|(_, root)| root).unwrap_or(&msg);
             eprintln!("  Error: {display_msg}");
 
             if !is_interactive {
@@ -633,13 +630,8 @@ async fn test_database_connection(
         "password": password,
     });
 
-    let provider = kyomi_datasource::create_provider(
-        &ds_type,
-        &connection_config,
-        &credentials,
-        None,
-    )
-    .await?;
+    let provider =
+        kyomi_datasource::create_provider(&ds_type, &connection_config, &credentials, None).await?;
 
     provider
         .test_connection()
@@ -679,10 +671,8 @@ mod tests {
 
     #[test]
     fn resolve_token_from_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "kyomi-connect-test-token-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kyomi-connect-test-token-{}", std::process::id()));
         std::fs::write(&tmp, "  file-token  \n").unwrap();
 
         let result = resolve_token(None, Some(tmp.display().to_string()));

@@ -311,10 +311,7 @@ pub fn map_databricks_type(type_name: &str) -> SimpleType {
     if upper.starts_with("DECIMAL(") || upper.starts_with("NUMERIC(") {
         return SimpleType::Number;
     }
-    if upper.starts_with("ARRAY<")
-        || upper.starts_with("MAP<")
-        || upper.starts_with("STRUCT<")
-    {
+    if upper.starts_with("ARRAY<") || upper.starts_with("MAP<") || upper.starts_with("STRUCT<") {
         return SimpleType::String;
     }
     if upper.starts_with("VARCHAR(") || upper.starts_with("CHAR(") {
@@ -413,9 +410,7 @@ pub fn map_bigquery_type(type_name: &str) -> SimpleType {
         "TIME" => SimpleType::Time,
 
         // Numeric
-        "INT64" | "INTEGER" | "FLOAT64" | "FLOAT" | "NUMERIC" | "BIGNUMERIC" => {
-            SimpleType::Number
-        }
+        "INT64" | "INTEGER" | "FLOAT64" | "FLOAT" | "NUMERIC" | "BIGNUMERIC" => SimpleType::Number,
 
         // String
         "STRING" | "BYTES" | "GEOGRAPHY" | "JSON" => SimpleType::String,
@@ -506,9 +501,9 @@ mod tests {
 
     #[test]
     fn postgres_money_interval_bytea() {
-        assert_eq!(map_postgres_type_oid(790), SimpleType::Number);  // money
+        assert_eq!(map_postgres_type_oid(790), SimpleType::Number); // money
         assert_eq!(map_postgres_type_oid(1186), SimpleType::String); // interval
-        assert_eq!(map_postgres_type_oid(17), SimpleType::String);   // bytea
+        assert_eq!(map_postgres_type_oid(17), SimpleType::String); // bytea
     }
 
     #[test]
@@ -568,7 +563,10 @@ mod tests {
     fn mysql_unsigned_types() {
         assert_eq!(map_mysql_type_name("TINYINT UNSIGNED"), SimpleType::Number);
         assert_eq!(map_mysql_type_name("SMALLINT UNSIGNED"), SimpleType::Number);
-        assert_eq!(map_mysql_type_name("MEDIUMINT UNSIGNED"), SimpleType::Number);
+        assert_eq!(
+            map_mysql_type_name("MEDIUMINT UNSIGNED"),
+            SimpleType::Number
+        );
         assert_eq!(map_mysql_type_name("INT UNSIGNED"), SimpleType::Number);
         assert_eq!(map_mysql_type_name("BIGINT UNSIGNED"), SimpleType::Number);
         // Parameterised + unsigned
@@ -593,14 +591,8 @@ mod tests {
 
     #[test]
     fn clickhouse_nullable_wrapper() {
-        assert_eq!(
-            map_clickhouse_type("Nullable(String)"),
-            SimpleType::String
-        );
-        assert_eq!(
-            map_clickhouse_type("Nullable(Int32)"),
-            SimpleType::Number
-        );
+        assert_eq!(map_clickhouse_type("Nullable(String)"), SimpleType::String);
+        assert_eq!(map_clickhouse_type("Nullable(Int32)"), SimpleType::Number);
         assert_eq!(
             map_clickhouse_type("Nullable(DateTime)"),
             SimpleType::Timestamp
@@ -620,18 +612,12 @@ mod tests {
         // LowCardinality(Nullable(String)) — strip outer LowCardinality first,
         // but since we strip sequentially (not nested), this tests the outer strip.
         // The inner Nullable(String) should still map correctly.
-        assert_eq!(
-            map_clickhouse_type("Nullable(String)"),
-            SimpleType::String
-        );
+        assert_eq!(map_clickhouse_type("Nullable(String)"), SimpleType::String);
     }
 
     #[test]
     fn clickhouse_complex_types() {
-        assert_eq!(
-            map_clickhouse_type("Array(String)"),
-            SimpleType::String
-        );
+        assert_eq!(map_clickhouse_type("Array(String)"), SimpleType::String);
         assert_eq!(map_clickhouse_type("JSON"), SimpleType::String);
     }
 
@@ -641,22 +627,13 @@ mod tests {
             map_clickhouse_type("Enum8('a' = 1, 'b' = 2)"),
             SimpleType::String
         );
-        assert_eq!(
-            map_clickhouse_type("FixedString(16)"),
-            SimpleType::String
-        );
+        assert_eq!(map_clickhouse_type("FixedString(16)"), SimpleType::String);
     }
 
     #[test]
     fn clickhouse_decimal() {
-        assert_eq!(
-            map_clickhouse_type("Decimal(18,2)"),
-            SimpleType::Number
-        );
-        assert_eq!(
-            map_clickhouse_type("Decimal128(2)"),
-            SimpleType::Number
-        );
+        assert_eq!(map_clickhouse_type("Decimal(18,2)"), SimpleType::Number);
+        assert_eq!(map_clickhouse_type("Decimal128(2)"), SimpleType::Number);
     }
 
     // --- Snowflake ---
@@ -702,22 +679,13 @@ mod tests {
 
     #[test]
     fn databricks_parameterised_types() {
-        assert_eq!(
-            map_databricks_type("DECIMAL(10,2)"),
-            SimpleType::Number
-        );
-        assert_eq!(
-            map_databricks_type("ARRAY<STRING>"),
-            SimpleType::String
-        );
+        assert_eq!(map_databricks_type("DECIMAL(10,2)"), SimpleType::Number);
+        assert_eq!(map_databricks_type("ARRAY<STRING>"), SimpleType::String);
         assert_eq!(
             map_databricks_type("STRUCT<name:STRING>"),
             SimpleType::String
         );
-        assert_eq!(
-            map_databricks_type("MAP<STRING,INT>"),
-            SimpleType::String
-        );
+        assert_eq!(map_databricks_type("MAP<STRING,INT>"), SimpleType::String);
     }
 
     #[test]

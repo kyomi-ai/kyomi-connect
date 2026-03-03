@@ -108,12 +108,8 @@ impl SynapseProvider {
 
         // Determine the auth method based on auth_mode
         let auth = match auth_mode {
-            "service_principal" => {
-                Self::get_service_principal_auth(credentials).await?
-            }
-            "oauth" | "enterprise_oauth" => {
-                Self::get_oauth_auth(credentials)?
-            }
+            "service_principal" => Self::get_service_principal_auth(credentials).await?,
+            "oauth" | "enterprise_oauth" => Self::get_oauth_auth(credentials)?,
             _ => {
                 // Default: SQL authentication
                 Self::get_sql_auth(credentials)?
@@ -137,20 +133,20 @@ impl SynapseProvider {
 
         // Establish TCP connection
         let addr = config.get_addr();
-        let tcp = tokio::time::timeout(
-            crate::DATASOURCE_TIMEOUT_CONNECT,
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| {
-            Error::Internal(format!(
-                "Azure Synapse TCP connection to {addr} timed out after {}s",
-                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-            ))
-        })?
-        .map_err(|e| {
-            Error::Internal(format!("Azure Synapse TCP connection to {addr} failed: {e}"))
-        })?;
+        let tcp =
+            tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, TcpStream::connect(&addr))
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "Azure Synapse TCP connection to {addr} timed out after {}s",
+                        crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+                    ))
+                })?
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "Azure Synapse TCP connection to {addr} failed: {e}"
+                    ))
+                })?;
 
         tcp.set_nodelay(true)
             .map_err(|e| Error::Internal(format!("Failed to set TCP_NODELAY: {e}")))?;
@@ -179,9 +175,7 @@ impl SynapseProvider {
         let username = credentials
             .get("username")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Provider("Azure Synapse SQL auth requires a username".into())
-            })?;
+            .ok_or_else(|| Error::Provider("Azure Synapse SQL auth requires a username".into()))?;
 
         let password = credentials
             .get("password")
@@ -217,26 +211,19 @@ impl SynapseProvider {
         let tenant_id = credentials
             .get("tenant_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Provider("Service Principal requires tenant_id".into())
-            })?;
+            .ok_or_else(|| Error::Provider("Service Principal requires tenant_id".into()))?;
 
         let client_id = credentials
             .get("client_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Provider("Service Principal requires client_id".into())
-            })?;
+            .ok_or_else(|| Error::Provider("Service Principal requires client_id".into()))?;
 
         let client_secret = credentials
             .get("client_secret")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Provider("Service Principal requires client_secret".into())
-            })?;
+            .ok_or_else(|| Error::Provider("Service Principal requires client_secret".into()))?;
 
-        let token_url =
-            AZURE_TOKEN_URL_TEMPLATE.replace("{tenant_id}", tenant_id);
+        let token_url = AZURE_TOKEN_URL_TEMPLATE.replace("{tenant_id}", tenant_id);
 
         tracing::info!(
             tenant_id = tenant_id,
@@ -258,12 +245,8 @@ impl SynapseProvider {
                 .send(),
         )
         .await
-        .map_err(|_| {
-            Error::Internal("Azure AD token request timed out".into())
-        })?
-        .map_err(|e| {
-            Error::Internal(format!("Azure AD token request failed: {e}"))
-        })?;
+        .map_err(|_| Error::Internal("Azure AD token request timed out".into()))?
+        .map_err(|e| Error::Internal(format!("Azure AD token request failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -273,10 +256,9 @@ impl SynapseProvider {
             )));
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to parse Azure AD token response: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            Error::Internal(format!("Failed to parse Azure AD token response: {e}"))
+        })?;
 
         let access_token = body
             .get("access_token")
@@ -342,8 +324,7 @@ impl DatasourceProvider for SynapseProvider {
         // literal, so we escape single quotes (SQL standard: ' → '') and wrap in N'...'.
         // This is not a SQL injection risk since users can already run arbitrary SQL.
         let sql_escaped = sql.replace('\'', "''");
-        let describe_sql =
-            format!("EXEC sp_describe_first_result_set @tsql = N'{sql_escaped}'");
+        let describe_sql = format!("EXEC sp_describe_first_result_set @tsql = N'{sql_escaped}'");
 
         let result = tokio::time::timeout(
             crate::DATASOURCE_TIMEOUT_DRY_RUN,
@@ -419,10 +400,7 @@ impl DatasourceProvider for SynapseProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -455,10 +433,7 @@ impl DatasourceProvider for SynapseProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -499,7 +474,10 @@ mod tests {
 
     #[test]
     fn azure_database_scope_is_correct() {
-        assert_eq!(AZURE_DATABASE_SCOPE, "https://database.windows.net/.default");
+        assert_eq!(
+            AZURE_DATABASE_SCOPE,
+            "https://database.windows.net/.default"
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::provider::ColumnInfo;
-use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::Error;
+use kyomi_connect_protocol::QueryStreamEvent;
 
 // ---------------------------------------------------------------------------
 // prepare_query — shared SQL normalisation + pagination
@@ -42,11 +42,7 @@ pub(crate) struct PreparedQuery {
 ///
 /// Used by PostgreSQL, MySQL, ClickHouse, and Snowflake (all share the same
 /// normalisation rules).
-pub(crate) fn prepare_query(
-    sql: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> PreparedQuery {
+pub(crate) fn prepare_query(sql: &str, limit: Option<u32>, offset: Option<u32>) -> PreparedQuery {
     let sql_stripped = sql.trim().trim_end_matches(';').trim();
     let sql_upper = sql_stripped.to_uppercase();
     let is_select = sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH");
@@ -162,11 +158,7 @@ pub(crate) async fn drive_sqlx_stream<R, S, FC, FR>(
 
     loop {
         // Apply per-row timeout so a stalled connection doesn't hang forever.
-        let next = tokio::time::timeout(
-            crate::DATASOURCE_TIMEOUT_QUERY,
-            row_stream.next(),
-        )
-        .await;
+        let next = tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, row_stream.next()).await;
 
         let row_item = match next {
             Ok(Some(Ok(row))) => Some(row),
@@ -216,15 +208,9 @@ pub(crate) async fn drive_sqlx_stream<R, S, FC, FR>(
 
                 // Flush chunk when full
                 if chunk_buffer.len() >= chunk_size {
-                    let rows = std::mem::replace(
-                        &mut chunk_buffer,
-                        Vec::with_capacity(chunk_size),
-                    );
+                    let rows = std::mem::replace(&mut chunk_buffer, Vec::with_capacity(chunk_size));
                     if tx
-                        .send(Ok(QueryStreamEvent::Chunk {
-                            rows,
-                            chunk_index,
-                        }))
+                        .send(Ok(QueryStreamEvent::Chunk { rows, chunk_index }))
                         .await
                         .is_err()
                     {
@@ -235,27 +221,23 @@ pub(crate) async fn drive_sqlx_stream<R, S, FC, FR>(
             }
             None => {
                 // Stream exhausted -- emit header if we never got any rows
-                if !columns_ready {
-                    if tx
+                if !columns_ready
+                    && tx
                         .send(Ok(QueryStreamEvent::Header {
                             columns: Vec::new(),
                             total_rows,
                         }))
                         .await
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
 
                 // Flush remaining rows
                 if !chunk_buffer.is_empty() {
                     let rows = std::mem::take(&mut chunk_buffer);
                     if tx
-                        .send(Ok(QueryStreamEvent::Chunk {
-                            rows,
-                            chunk_index,
-                        }))
+                        .send(Ok(QueryStreamEvent::Chunk { rows, chunk_index }))
                         .await
                         .is_err()
                     {
@@ -290,7 +272,8 @@ pub(crate) fn make_stream_channel() -> (
 ) {
     // Buffer of 4 events: allows pipeline of Header + a few Chunks.
     // Each Chunk event carries chunk_size rows.
-    let (tx, rx) = tokio::sync::mpsc::channel::<kyomi_connect_protocol::Result<QueryStreamEvent>>(4);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<kyomi_connect_protocol::Result<QueryStreamEvent>>(4);
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -377,8 +360,7 @@ mod tests {
         let (tx, stream) = make_stream_channel();
 
         tokio::spawn(async move {
-            let empty_stream =
-                futures_util::stream::empty::<Result<Vec<Value>, sqlx::Error>>();
+            let empty_stream = futures_util::stream::empty::<Result<Vec<Value>, sqlx::Error>>();
             drive_sqlx_stream(
                 tx,
                 empty_stream,
@@ -399,7 +381,10 @@ mod tests {
         assert_eq!(events.len(), 2); // Header + Complete (no Chunks)
 
         match &events[0] {
-            QueryStreamEvent::Header { columns, total_rows } => {
+            QueryStreamEvent::Header {
+                columns,
+                total_rows,
+            } => {
                 assert!(columns.is_empty());
                 assert_eq!(*total_rows, Some(42));
             }
@@ -407,7 +392,10 @@ mod tests {
         }
 
         match &events[1] {
-            QueryStreamEvent::Complete { total_rows_returned, .. } => {
+            QueryStreamEvent::Complete {
+                total_rows_returned,
+                ..
+            } => {
                 assert_eq!(*total_rows_returned, 0);
             }
             other => panic!("expected Complete, got {other:?}"),
@@ -435,8 +423,14 @@ mod tests {
                 Instant::now(),
                 |_row: &Vec<Value>| {
                     vec![
-                        ColumnInfo { name: "id".into(), col_type: SimpleType::Number },
-                        ColumnInfo { name: "name".into(), col_type: SimpleType::String },
+                        ColumnInfo {
+                            name: "id".into(),
+                            col_type: SimpleType::Number,
+                        },
+                        ColumnInfo {
+                            name: "name".into(),
+                            col_type: SimpleType::String,
+                        },
                     ]
                 },
                 |row: &Vec<Value>, _cols: &[ColumnInfo]| row.clone(),
@@ -477,7 +471,11 @@ mod tests {
         }
 
         match &events[3] {
-            QueryStreamEvent::Complete { total_rows_returned, total_chunks, .. } => {
+            QueryStreamEvent::Complete {
+                total_rows_returned,
+                total_chunks,
+                ..
+            } => {
                 assert_eq!(*total_rows_returned, 3);
                 assert_eq!(*total_chunks, 2);
             }

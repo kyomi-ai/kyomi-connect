@@ -7,7 +7,17 @@
 //! All providers are feature-gated — only enabled providers are compiled.
 
 // Shared modules — conditionally compiled based on which providers are enabled
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift", feature = "databricks"))]
+#[cfg(any(
+    feature = "postgres",
+    feature = "mysql",
+    feature = "redshift",
+    feature = "clickhouse",
+    feature = "snowflake",
+    feature = "databricks",
+    feature = "bigquery",
+    feature = "sqlserver",
+    feature = "synapse",
+))]
 pub(crate) mod sqlx_common;
 
 #[cfg(any(feature = "sqlserver", feature = "synapse"))]

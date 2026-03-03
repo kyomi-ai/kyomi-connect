@@ -37,9 +37,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::factory::UserContext;
-use crate::provider::{
-    ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus,
-};
+use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::type_mapping::map_bigquery_type;
 use kyomi_connect_protocol::QueryStreamEvent;
 
@@ -55,8 +53,7 @@ const GCP_RESOURCE_MANAGER_URL: &str = "https://cloudresourcemanager.googleapis.
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Scopes requested for BigQuery service account access.
-const SERVICE_ACCOUNT_SCOPES: &str =
-    "https://www.googleapis.com/auth/bigquery.readonly https://www.googleapis.com/auth/cloudplatformprojects.readonly";
+const SERVICE_ACCOUNT_SCOPES: &str = "https://www.googleapis.com/auth/bigquery.readonly https://www.googleapis.com/auth/cloudplatformprojects.readonly";
 
 /// Resolve billing project with consistent precedence:
 /// 1. `connection_config["billing_project"]` (workspace-level)
@@ -152,9 +149,12 @@ impl BigQueryProvider {
                     .get("oauth_access_token")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| Error::Provider(
-                        "BigQuery enterprise_oauth requires oauth_access_token in credentials".into(),
-                    ))?
+                    .ok_or_else(|| {
+                        Error::Provider(
+                            "BigQuery enterprise_oauth requires oauth_access_token in credentials"
+                                .into(),
+                        )
+                    })?
                     .to_string();
                 tracing::info!("BigQuery: Using enterprise OAuth token");
                 (token, None)
@@ -172,15 +172,14 @@ impl BigQueryProvider {
             }
         };
 
-        let billing_project = resolve_billing_project(
-            connection_config,
-            credentials,
-            sa_project_id.as_deref(),
-        )
-        .ok_or_else(|| Error::Provider(
+        let billing_project =
+            resolve_billing_project(connection_config, credentials, sa_project_id.as_deref())
+                .ok_or_else(|| {
+                    Error::Provider(
             "BigQuery requires a billing project. Set billing_project in datasource settings."
                 .into(),
-        ))?;
+        )
+                })?;
 
         tracing::info!(
             auth_mode = auth_mode,
@@ -208,35 +207,26 @@ impl BigQueryProvider {
         let mut page_token: Option<String> = None;
 
         loop {
-            let mut url = format!(
-                "{GCP_RESOURCE_MANAGER_URL}/projects?filter=lifecycleState:ACTIVE"
-            );
+            let mut url =
+                format!("{GCP_RESOURCE_MANAGER_URL}/projects?filter=lifecycleState:ACTIVE");
             if let Some(ref token) = page_token {
                 url.push_str(&format!("&pageToken={token}"));
             }
 
             let response = tokio::time::timeout(
                 crate::DATASOURCE_TIMEOUT_CONNECT,
-                self.client
-                    .get(&url)
-                    .bearer_auth(&self.access_token)
-                    .send(),
+                self.client.get(&url).bearer_auth(&self.access_token).send(),
             )
             .await
-            .map_err(|_| Error::Internal(
-                "GCP Resource Manager API request timed out".into(),
-            ))?
-            .map_err(|e| Error::Internal(format!(
-                "GCP Resource Manager API request failed: {e}"
-            )))?;
+            .map_err(|_| Error::Internal("GCP Resource Manager API request timed out".into()))?
+            .map_err(|e| {
+                Error::Internal(format!("GCP Resource Manager API request failed: {e}"))
+            })?;
 
             let status_code = response.status();
-            let body: Value = response
-                .json()
-                .await
-                .map_err(|e| Error::Internal(format!(
-                    "Failed to parse Resource Manager response: {e}"
-                )))?;
+            let body: Value = response.json().await.map_err(|e| {
+                Error::Internal(format!("Failed to parse Resource Manager response: {e}"))
+            })?;
 
             if status_code.is_client_error() || status_code.is_server_error() {
                 let msg = body
@@ -311,10 +301,7 @@ impl BigQueryProvider {
             }
         });
 
-        let url = format!(
-            "{BIGQUERY_API_BASE}/projects/{}/jobs",
-            self.billing_project
-        );
+        let url = format!("{BIGQUERY_API_BASE}/projects/{}/jobs", self.billing_project);
 
         let response = tokio::time::timeout(
             if dry_run {
@@ -330,10 +317,12 @@ impl BigQueryProvider {
                 .send(),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "BigQuery job submission timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "BigQuery job submission timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("BigQuery HTTP request failed: {e}")))?;
 
         let status_code = response.status();
@@ -382,7 +371,10 @@ impl BigQueryProvider {
 
         let job_body = if job_status == "DONE" {
             // Check for errors in the completed job
-            if let Some(err) = response_body.get("status").and_then(|s| s.get("errorResult")) {
+            if let Some(err) = response_body
+                .get("status")
+                .and_then(|s| s.get("errorResult"))
+            {
                 let msg = err
                     .get("message")
                     .and_then(|m| m.as_str())
@@ -426,9 +418,7 @@ impl BigQueryProvider {
 
         loop {
             if Instant::now() > deadline {
-                return Err(Error::Internal(
-                    "BigQuery job polling timed out".into(),
-                ));
+                return Err(Error::Internal("BigQuery job polling timed out".into()));
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -449,12 +439,9 @@ impl BigQueryProvider {
                 .await
                 .map_err(|e| Error::Internal(format!("BigQuery poll failed: {e}")))?;
 
-            let body: Value = response
-                .json()
-                .await
-                .map_err(|e| Error::Internal(format!(
-                    "Failed to parse BigQuery poll response: {e}"
-                )))?;
+            let body: Value = response.json().await.map_err(|e| {
+                Error::Internal(format!("Failed to parse BigQuery poll response: {e}"))
+            })?;
 
             let state = body
                 .get("status")
@@ -505,12 +492,9 @@ impl BigQueryProvider {
             .map_err(|e| Error::Internal(format!("BigQuery get results failed: {e}")))?;
 
         let status_code = response.status();
-        let mut results_body: Value = response
-            .json()
-            .await
-            .map_err(|e| Error::Internal(format!(
-                "Failed to parse BigQuery results response: {e}"
-            )))?;
+        let mut results_body: Value = response.json().await.map_err(|e| {
+            Error::Internal(format!("Failed to parse BigQuery results response: {e}"))
+        })?;
 
         if status_code.is_client_error() || status_code.is_server_error() {
             let msg = extract_bigquery_error(&results_body);
@@ -550,19 +534,20 @@ impl DatasourceProvider for BigQueryProvider {
                 .send(),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "BigQuery test connection timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "BigQuery test connection timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("BigQuery test connection failed: {e}")))?;
 
         let status_code = response.status();
-        let response_body: Value = response
-            .json()
-            .await
-            .map_err(|e| Error::Internal(format!(
+        let response_body: Value = response.json().await.map_err(|e| {
+            Error::Internal(format!(
                 "Failed to parse BigQuery test connection response: {e}"
-            )))?;
+            ))
+        })?;
 
         if status_code.is_client_error() || status_code.is_server_error() {
             let msg = extract_bigquery_error(&response_body);
@@ -619,10 +604,7 @@ impl DatasourceProvider for BigQueryProvider {
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        let type_name = field
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let type_name = field.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         ColumnInfo {
                             name,
                             col_type: map_bigquery_type(type_name),
@@ -638,13 +620,11 @@ impl DatasourceProvider for BigQueryProvider {
         // Extract total rows from the query response (available at zero cost
         // from the BigQuery API — only conditionally populated based on caller).
         let total_rows = if include_total {
-            result
-                .get("totalRows")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .or_else(|| v.as_i64())
-                })
+            result.get("totalRows").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
         } else {
             None
         };
@@ -661,13 +641,11 @@ impl DatasourceProvider for BigQueryProvider {
             })
             .or_else(|| {
                 // Also check top-level totalBytesProcessed
-                result
-                    .get("totalBytesProcessed")
-                    .and_then(|v| {
-                        v.as_str()
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .or_else(|| v.as_i64())
-                    })
+                result.get("totalBytesProcessed").and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .or_else(|| v.as_i64())
+                })
             });
 
         let effective_limit = limit.unwrap_or(1000);
@@ -808,10 +786,8 @@ impl DatasourceProvider for BigQueryProvider {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("?")
                                 .to_string();
-                            let type_name = field
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
+                            let type_name =
+                                field.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             ColumnInfo {
                                 name,
                                 col_type: map_bigquery_type(type_name),
@@ -823,13 +799,11 @@ impl DatasourceProvider for BigQueryProvider {
 
             // Conditionally extract total_rows based on include_total flag.
             let total_rows = if include_total {
-                first_page
-                    .get("totalRows")
-                    .and_then(|v| {
-                        v.as_str()
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .or_else(|| v.as_i64())
-                    })
+                first_page.get("totalRows").and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .or_else(|| v.as_i64())
+                })
             } else {
                 None
             };
@@ -954,13 +928,15 @@ impl DatasourceProvider for BigQueryProvider {
 ///
 /// The token lives at `oauth_data.google_oauth_tokens.access_token`.
 fn resolve_kyomi_oauth_token(user_context: Option<&UserContext>) -> Result<String, Error> {
-    let ctx = user_context.ok_or_else(|| Error::Provider(
-        "BigQuery kyomi_oauth mode requires user context with OAuth data".into(),
-    ))?;
+    let ctx = user_context.ok_or_else(|| {
+        Error::Provider("BigQuery kyomi_oauth mode requires user context with OAuth data".into())
+    })?;
 
-    let oauth_data = ctx.oauth_data.as_ref().ok_or_else(|| Error::Provider(
-        "BigQuery kyomi_oauth mode requires Google OAuth data in user context".into(),
-    ))?;
+    let oauth_data = ctx.oauth_data.as_ref().ok_or_else(|| {
+        Error::Provider(
+            "BigQuery kyomi_oauth mode requires Google OAuth data in user context".into(),
+        )
+    })?;
 
     oauth_data
         .get("google_oauth_tokens")
@@ -968,9 +944,11 @@ fn resolve_kyomi_oauth_token(user_context: Option<&UserContext>) -> Result<Strin
         .and_then(|t| t.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .ok_or_else(|| Error::Provider(
-            "BigQuery kyomi_oauth: missing access_token in google_oauth_tokens".into(),
-        ))
+        .ok_or_else(|| {
+            Error::Provider(
+                "BigQuery kyomi_oauth: missing access_token in google_oauth_tokens".into(),
+            )
+        })
 }
 
 /// Resolve a BigQuery access token based on the configured auth mode.
@@ -992,16 +970,16 @@ pub async fn resolve_access_token(
 
     match auth_mode {
         "kyomi_oauth" => resolve_kyomi_oauth_token(user_context),
-        "enterprise_oauth" => {
-            credentials
-                .get("oauth_access_token")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .ok_or_else(|| Error::Provider(
+        "enterprise_oauth" => credentials
+            .get("oauth_access_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| {
+                Error::Provider(
                     "BigQuery enterprise_oauth requires oauth_access_token in credentials".into(),
-                ))
-        }
+                )
+            }),
         "service_account" => {
             let (token, _project_id) =
                 exchange_service_account_jwt(&client, connection_config).await?;
@@ -1026,29 +1004,25 @@ pub async fn exchange_service_account_jwt(
     let sa_json_str = connection_config
         .get("service_account_json")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "BigQuery service_account mode requires service_account_json in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "BigQuery service_account mode requires service_account_json in connection config"
+                    .into(),
+            )
+        })?;
 
-    let sa_json: Value = serde_json::from_str(sa_json_str).map_err(|e| {
-        Error::Provider(format!(
-            "Invalid service_account_json: {e}"
-        ))
-    })?;
+    let sa_json: Value = serde_json::from_str(sa_json_str)
+        .map_err(|e| Error::Provider(format!("Invalid service_account_json: {e}")))?;
 
     let client_email = sa_json
         .get("client_email")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Service account JSON missing client_email".into(),
-        ))?;
+        .ok_or_else(|| Error::Provider("Service account JSON missing client_email".into()))?;
 
     let private_key_pem = sa_json
         .get("private_key")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Service account JSON missing private_key".into(),
-        ))?;
+        .ok_or_else(|| Error::Provider("Service account JSON missing private_key".into()))?;
 
     let project_id = sa_json
         .get("project_id")
@@ -1068,9 +1042,9 @@ pub async fn exchange_service_account_jwt(
 
     // Sign the JWT with RS256
     let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-        .map_err(|e| Error::Internal(format!(
-            "Failed to parse service account private key: {e}"
-        )))?;
+        .map_err(|e| {
+            Error::Internal(format!("Failed to parse service account private key: {e}"))
+        })?;
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     let jwt = jsonwebtoken::encode(&header, &claims, &encoding_key)
@@ -1087,20 +1061,14 @@ pub async fn exchange_service_account_jwt(
         client.post(GOOGLE_TOKEN_URL).form(&params).send(),
     )
     .await
-    .map_err(|_| Error::Internal(
-        "Service account token exchange timed out".into(),
-    ))?
-    .map_err(|e| Error::Internal(format!(
-        "Service account token exchange HTTP failed: {e}"
-    )))?;
+    .map_err(|_| Error::Internal("Service account token exchange timed out".into()))?
+    .map_err(|e| Error::Internal(format!("Service account token exchange HTTP failed: {e}")))?;
 
     let status = response.status();
     let body: Value = response
         .json()
         .await
-        .map_err(|e| Error::Internal(format!(
-            "Failed to parse token exchange response: {e}"
-        )))?;
+        .map_err(|e| Error::Internal(format!("Failed to parse token exchange response: {e}")))?;
 
     if !status.is_success() {
         let error = body
@@ -1115,9 +1083,7 @@ pub async fn exchange_service_account_jwt(
     let access_token = body
         .get("access_token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Internal(
-            "Token exchange response missing access_token".into(),
-        ))?
+        .ok_or_else(|| Error::Internal("Token exchange response missing access_token".into()))?
         .to_string();
 
     Ok((access_token, project_id))
@@ -1146,9 +1112,7 @@ async fn fetch_query_results_page(
     let body: Value = response
         .json()
         .await
-        .map_err(|e| Error::Internal(format!(
-            "Failed to parse BigQuery results response: {e}"
-        )))?;
+        .map_err(|e| Error::Internal(format!("Failed to parse BigQuery results response: {e}")))?;
 
     if status_code.is_client_error() || status_code.is_server_error() {
         let msg = extract_bigquery_error(&body);
@@ -1312,10 +1276,7 @@ mod tests {
                 }]
             }
         });
-        assert_eq!(
-            extract_bigquery_error(&response),
-            "Syntax error at [1:5]"
-        );
+        assert_eq!(extract_bigquery_error(&response), "Syntax error at [1:5]");
     }
 
     #[test]
@@ -1338,10 +1299,7 @@ mod tests {
     #[test]
     fn extract_error_unknown_format() {
         let response = serde_json::json!({"someField": "someValue"});
-        assert_eq!(
-            extract_bigquery_error(&response),
-            "Unknown BigQuery error"
-        );
+        assert_eq!(extract_bigquery_error(&response), "Unknown BigQuery error");
     }
 
     // --- format_bytes ---
@@ -1517,9 +1475,6 @@ mod tests {
         let result = BigQueryProvider::new(&config, &creds, None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("oauth_access_token"),
-            "Error: {err}"
-        );
+        assert!(err.contains("oauth_access_token"), "Error: {err}");
     }
 }

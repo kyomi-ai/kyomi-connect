@@ -24,24 +24,24 @@ use kyomi_connect_protocol::DatasourceType;
 
 use crate::provider::DatasourceProvider;
 
-#[cfg(feature = "postgres")]
-use crate::providers::postgres::PostgresProvider;
-#[cfg(feature = "mysql")]
-use crate::providers::mysql::MySqlProvider;
-#[cfg(feature = "redshift")]
-use crate::providers::redshift::RedshiftProvider;
+#[cfg(feature = "bigquery")]
+use crate::providers::bigquery::BigQueryProvider;
 #[cfg(feature = "clickhouse")]
 use crate::providers::clickhouse::ClickHouseProvider;
-#[cfg(feature = "snowflake")]
-use crate::providers::snowflake::SnowflakeProvider;
 #[cfg(feature = "databricks")]
 use crate::providers::databricks::DatabricksProvider;
+#[cfg(feature = "mysql")]
+use crate::providers::mysql::MySqlProvider;
+#[cfg(feature = "postgres")]
+use crate::providers::postgres::PostgresProvider;
+#[cfg(feature = "redshift")]
+use crate::providers::redshift::RedshiftProvider;
+#[cfg(feature = "snowflake")]
+use crate::providers::snowflake::SnowflakeProvider;
 #[cfg(feature = "sqlserver")]
 use crate::providers::sqlserver::SqlServerProvider;
 #[cfg(feature = "synapse")]
 use crate::providers::synapse::SynapseProvider;
-#[cfg(feature = "bigquery")]
-use crate::providers::bigquery::BigQueryProvider;
 
 // ---------------------------------------------------------------------------
 // UserContext — additional context for BigQuery OAuth
@@ -142,17 +142,34 @@ pub async fn create_provider(
     ds_type: &DatasourceType,
     connection_config: &serde_json::Value,
     credentials: &serde_json::Value,
-    #[cfg_attr(not(feature = "bigquery"), allow(unused_variables))]
-    user_context: Option<&UserContext>,
+    #[cfg_attr(not(feature = "bigquery"), allow(unused_variables))] user_context: Option<
+        &UserContext,
+    >,
 ) -> kyomi_connect_protocol::Result<Box<dyn DatasourceProvider>> {
     // Resolve shared credentials before passing to provider constructors.
-    #[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift",
-              feature = "clickhouse", feature = "snowflake", feature = "databricks",
-              feature = "sqlserver", feature = "synapse", feature = "bigquery"))]
+    #[cfg(any(
+        feature = "postgres",
+        feature = "mysql",
+        feature = "redshift",
+        feature = "clickhouse",
+        feature = "snowflake",
+        feature = "databricks",
+        feature = "sqlserver",
+        feature = "synapse",
+        feature = "bigquery"
+    ))]
     let resolved_credentials = resolve_shared_credentials(connection_config, credentials);
-    #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "redshift",
-                  feature = "clickhouse", feature = "snowflake", feature = "databricks",
-                  feature = "sqlserver", feature = "synapse", feature = "bigquery")))]
+    #[cfg(not(any(
+        feature = "postgres",
+        feature = "mysql",
+        feature = "redshift",
+        feature = "clickhouse",
+        feature = "snowflake",
+        feature = "databricks",
+        feature = "sqlserver",
+        feature = "synapse",
+        feature = "bigquery"
+    )))]
     let _ = (connection_config, credentials);
 
     match ds_type {
@@ -188,7 +205,8 @@ pub async fn create_provider(
 
         #[cfg(feature = "clickhouse")]
         DatasourceType::ClickHouse => {
-            let provider = ClickHouseProvider::new(connection_config, &resolved_credentials).await?;
+            let provider =
+                ClickHouseProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "clickhouse"))]
@@ -208,7 +226,8 @@ pub async fn create_provider(
 
         #[cfg(feature = "databricks")]
         DatasourceType::Databricks => {
-            let provider = DatabricksProvider::new(connection_config, &resolved_credentials).await?;
+            let provider =
+                DatabricksProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "databricks"))]
@@ -218,8 +237,7 @@ pub async fn create_provider(
 
         #[cfg(feature = "sqlserver")]
         DatasourceType::SqlServer => {
-            let provider =
-                SqlServerProvider::new(connection_config, &resolved_credentials).await?;
+            let provider = SqlServerProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "sqlserver"))]
@@ -229,8 +247,7 @@ pub async fn create_provider(
 
         #[cfg(feature = "synapse")]
         DatasourceType::Synapse => {
-            let provider =
-                SynapseProvider::new(connection_config, &resolved_credentials).await?;
+            let provider = SynapseProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "synapse"))]
@@ -347,7 +364,10 @@ mod tests {
         let creds = serde_json::json!({});
 
         let result = create_provider(&DatasourceType::BigQuery, &config, &creds, None).await;
-        assert!(result.is_err(), "Expected error for BigQuery without credentials");
+        assert!(
+            result.is_err(),
+            "Expected error for BigQuery without credentials"
+        );
         let err_msg = match result {
             Err(e) => e.to_string(),
             Ok(_) => panic!("Expected error for BigQuery without credentials"),

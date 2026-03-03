@@ -1,11 +1,11 @@
 use std::str::FromStr;
 
 use futures_util::StreamExt;
+use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::wire::{
     CatalogColumn, CatalogContainer, CatalogResult, CatalogTable, ConnectOp, ConnectRequest,
     ConnectResponse, ConnectResponseBody, DryRunParams, QueryParams,
 };
-use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_datasource::provider::DatasourceProvider;
 
 /// Streaming threshold: queries requesting more than this many rows (or no
@@ -119,7 +119,12 @@ impl CommandExecutor {
             // Buffered path: single Result response (zero overhead for common case)
             let result = match self
                 .provider
-                .execute_query(&params.sql, params.limit, params.offset, params.include_total)
+                .execute_query(
+                    &params.sql,
+                    params.limit,
+                    params.offset,
+                    params.include_total,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -334,10 +339,7 @@ impl CommandExecutor {
 
     /// Discover tables in a container.
     /// Returns (table_name, table_type) pairs.
-    async fn discover_tables(
-        &self,
-        container: &str,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+    async fn discover_tables(&self, container: &str) -> anyhow::Result<Vec<(String, String)>> {
         let sql = match self.db_type.as_str() {
             "postgres" | "redshift" => format!(
                 "SELECT table_name, table_type FROM information_schema.tables \
@@ -429,9 +431,7 @@ impl CommandExecutor {
             .execute_query(&sql, None, None, false)
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to list columns for '{container}.{table_name}': {e}"
-                )
+                anyhow::anyhow!("Failed to list columns for '{container}.{table_name}': {e}")
             })?;
 
         let columns = result

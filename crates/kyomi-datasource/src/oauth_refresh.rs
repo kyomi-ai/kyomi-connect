@@ -97,9 +97,7 @@ pub async fn ensure_valid_oauth_credentials(
         DatasourceType::Databricks => {
             refresh_databricks(&client, refresh_token, connection_config).await
         }
-        DatasourceType::Synapse => {
-            refresh_synapse(&client, refresh_token, connection_config).await
-        }
+        DatasourceType::Synapse => refresh_synapse(&client, refresh_token, connection_config).await,
         _ => return Ok(credentials.clone()),
     };
 
@@ -124,7 +122,9 @@ pub async fn ensure_valid_oauth_credentials(
                     "OAuth refresh failed (re-authorization required): {err_msg}"
                 )));
             }
-            Err(Error::Internal(format!("OAuth token refresh failed: {err_msg}")))
+            Err(Error::Internal(format!(
+                "OAuth token refresh failed: {err_msg}"
+            )))
         }
     }
 }
@@ -247,16 +247,21 @@ async fn refresh_bigquery_enterprise(
     let client_id = connection_config
         .get("oauth_client_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "BigQuery enterprise OAuth requires oauth_client_id in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "BigQuery enterprise OAuth requires oauth_client_id in connection config".into(),
+            )
+        })?;
 
     let client_secret = connection_config
         .get("oauth_client_secret")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "BigQuery enterprise OAuth requires oauth_client_secret in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "BigQuery enterprise OAuth requires oauth_client_secret in connection config"
+                    .into(),
+            )
+        })?;
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -265,12 +270,7 @@ async fn refresh_bigquery_enterprise(
         ("client_secret", client_secret),
     ];
 
-    post_token_request(
-        client,
-        "https://oauth2.googleapis.com/token",
-        &params,
-    )
-    .await
+    post_token_request(client, "https://oauth2.googleapis.com/token", &params).await
 }
 
 /// Refresh a Snowflake OAuth token.
@@ -282,9 +282,9 @@ async fn refresh_snowflake(
     let account = connection_config
         .get("account")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Snowflake OAuth refresh requires account in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider("Snowflake OAuth refresh requires account in connection config".into())
+        })?;
 
     let client_id = connection_config
         .get("oauth_client_id")
@@ -296,9 +296,7 @@ async fn refresh_snowflake(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let url = format!(
-        "https://{account}.snowflakecomputing.com/oauth/token-request"
-    );
+    let url = format!("https://{account}.snowflakecomputing.com/oauth/token-request");
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -322,9 +320,11 @@ async fn refresh_databricks(
     let server_hostname = connection_config
         .get("server_hostname")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Databricks OAuth refresh requires server_hostname in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "Databricks OAuth refresh requires server_hostname in connection config".into(),
+            )
+        })?;
 
     let client_id = connection_config
         .get("oauth_client_id")
@@ -357,25 +357,25 @@ async fn refresh_synapse(
     let tenant_id = connection_config
         .get("tenant_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Synapse OAuth refresh requires tenant_id in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider("Synapse OAuth refresh requires tenant_id in connection config".into())
+        })?;
 
     let client_id = connection_config
         .get("oauth_client_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Synapse OAuth refresh requires oauth_client_id in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "Synapse OAuth refresh requires oauth_client_id in connection config".into(),
+            )
+        })?;
 
     let client_secret = connection_config
         .get("oauth_client_secret")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let url = format!(
-        "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    );
+    let url = format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token");
 
     let params = [
         ("grant_type", "refresh_token"),
@@ -435,9 +435,11 @@ async fn handle_databricks_m2m(
     let server_hostname = connection_config
         .get("server_hostname")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Provider(
-            "Databricks M2M OAuth requires server_hostname in connection config".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Provider(
+                "Databricks M2M OAuth requires server_hostname in connection config".into(),
+            )
+        })?;
 
     let token_url = format!("https://{server_hostname}/oidc/v1/token");
     let http = crate::http_client()?;
@@ -495,25 +497,21 @@ async fn post_token_request(
 ) -> Result<Value, Error> {
     let response = tokio::time::timeout(
         crate::OAUTH_REFRESH_TIMEOUT,
-        client
-            .post(url)
-            .form(params)
-            .send(),
+        client.post(url).form(params).send(),
     )
     .await
-    .map_err(|_| Error::Internal(format!(
-        "OAuth token refresh timed out after {}s",
-        crate::OAUTH_REFRESH_TIMEOUT.as_secs()
-    )))?
+    .map_err(|_| {
+        Error::Internal(format!(
+            "OAuth token refresh timed out after {}s",
+            crate::OAUTH_REFRESH_TIMEOUT.as_secs()
+        ))
+    })?
     .map_err(|e| Error::Internal(format!("OAuth token refresh HTTP request failed: {e}")))?;
 
     let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| Error::Internal(format!(
-            "Failed to parse OAuth token refresh response: {e}"
-        )))?;
+    let body: Value = response.json().await.map_err(|e| {
+        Error::Internal(format!("Failed to parse OAuth token refresh response: {e}"))
+    })?;
 
     if !status.is_success() {
         let error = body
@@ -605,7 +603,10 @@ mod tests {
     fn parse_expiry_iso_with_fractional_seconds() {
         let val = Value::String("2025-06-15T12:00:00.123456".into());
         let dt = parse_token_expiry(&val).expect("should parse");
-        assert_eq!(dt.format("%Y-%m-%dT%H:%M:%S").to_string(), "2025-06-15T12:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2025-06-15T12:00:00"
+        );
     }
 
     #[test]
@@ -786,23 +787,31 @@ mod tests {
 
     #[test]
     fn detects_invalid_grant() {
-        assert!(is_irrecoverable_grant_error("OAuth refresh failed (invalid_grant): Token has been revoked"));
+        assert!(is_irrecoverable_grant_error(
+            "OAuth refresh failed (invalid_grant): Token has been revoked"
+        ));
     }
 
     #[test]
     fn detects_invalid_token() {
-        assert!(is_irrecoverable_grant_error("Error: invalid_token - The token is expired"));
+        assert!(is_irrecoverable_grant_error(
+            "Error: invalid_token - The token is expired"
+        ));
     }
 
     #[test]
     fn detects_token_expired_or_revoked() {
-        assert!(is_irrecoverable_grant_error("Token has been expired or revoked"));
+        assert!(is_irrecoverable_grant_error(
+            "Token has been expired or revoked"
+        ));
     }
 
     #[test]
     fn does_not_flag_transient_errors() {
         assert!(!is_irrecoverable_grant_error("Connection timed out"));
-        assert!(!is_irrecoverable_grant_error("HTTP 500 Internal Server Error"));
+        assert!(!is_irrecoverable_grant_error(
+            "HTTP 500 Internal Server Error"
+        ));
     }
 
     // --- ensure_valid_oauth_credentials (non-OAuth types pass through) ---

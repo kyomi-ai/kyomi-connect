@@ -13,7 +13,7 @@ all = ["postgres", "mysql", "redshift", "clickhouse", "snowflake",
        "databricks", "sqlserver", "synapse", "bigquery"]
 postgres = ["dep:sqlx"]
 mysql = ["dep:sqlx"]
-redshift = ["dep:sqlx"]
+redshift = ["dep:sqlx", "postgres"]
 clickhouse = []
 snowflake = ["dep:jsonwebtoken", "dep:rsa"]
 databricks = []

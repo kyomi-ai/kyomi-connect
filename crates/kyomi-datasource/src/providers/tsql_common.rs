@@ -20,8 +20,8 @@ use tokio::sync::Mutex;
 use tokio_util::compat::Compat;
 
 use crate::provider::{ColumnInfo, QueryResult, QueryStatus, SimpleType};
-use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::Error;
+use kyomi_connect_protocol::QueryStreamEvent;
 
 /// Concrete TDS client type used by both SQL Server and Synapse providers.
 ///
@@ -172,9 +172,10 @@ pub(crate) fn map_column_type(ct: ColumnType) -> SimpleType {
         // Date/time types
         ColumnType::Daten => SimpleType::Date,
         ColumnType::Timen => SimpleType::Time,
-        ColumnType::Datetime | ColumnType::Datetime4 | ColumnType::Datetimen | ColumnType::Datetime2 => {
-            SimpleType::Timestamp
-        }
+        ColumnType::Datetime
+        | ColumnType::Datetime4
+        | ColumnType::Datetimen
+        | ColumnType::Datetime2 => SimpleType::Timestamp,
         ColumnType::DatetimeOffsetn => SimpleType::TimestampTz,
 
         // Null or unknown
@@ -337,9 +338,7 @@ pub(crate) async fn execute_tds_query(
     let effective_limit = limit.unwrap_or(1000);
     let effective_offset = offset.unwrap_or(0);
 
-    let paginated_sql = if is_select
-        && !sql_upper.contains("OFFSET")
-        && !sql_upper.contains("TOP")
+    let paginated_sql = if is_select && !sql_upper.contains("OFFSET") && !sql_upper.contains("TOP")
     {
         apply_tsql_pagination(sql_stripped, effective_limit, effective_offset)
     } else {
@@ -516,9 +515,7 @@ pub(crate) async fn execute_tds_query_stream(
     let effective_limit = limit.unwrap_or(1000);
     let effective_offset = offset.unwrap_or(0);
 
-    let paginated_sql = if is_select
-        && !sql_upper.contains("OFFSET")
-        && !sql_upper.contains("TOP")
+    let paginated_sql = if is_select && !sql_upper.contains("OFFSET") && !sql_upper.contains("TOP")
     {
         apply_tsql_pagination(sql_stripped, effective_limit, effective_offset)
     } else {
@@ -581,11 +578,8 @@ pub(crate) async fn execute_tds_query_stream(
         let mut item_stream = tds_stream;
 
         loop {
-            let next = tokio::time::timeout(
-                crate::DATASOURCE_TIMEOUT_QUERY,
-                item_stream.try_next(),
-            )
-            .await;
+            let next =
+                tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, item_stream.try_next()).await;
 
             let query_item = match next {
                 Ok(Ok(Some(item))) => Some(item),
@@ -668,15 +662,10 @@ pub(crate) async fn execute_tds_query_stream(
 
                     // Flush chunk when full
                     if chunk_buffer.len() >= chunk_size {
-                        let rows = std::mem::replace(
-                            &mut chunk_buffer,
-                            Vec::with_capacity(chunk_size),
-                        );
+                        let rows =
+                            std::mem::replace(&mut chunk_buffer, Vec::with_capacity(chunk_size));
                         if tx
-                            .send(Ok(QueryStreamEvent::Chunk {
-                                rows,
-                                chunk_index,
-                            }))
+                            .send(Ok(QueryStreamEvent::Chunk { rows, chunk_index }))
                             .await
                             .is_err()
                         {
@@ -694,27 +683,23 @@ pub(crate) async fn execute_tds_query_stream(
 
         // If we never got metadata (empty result set with no columns),
         // emit an empty header.
-        if !columns_ready {
-            if tx
+        if !columns_ready
+            && tx
                 .send(Ok(QueryStreamEvent::Header {
                     columns: Vec::new(),
                     total_rows,
                 }))
                 .await
                 .is_err()
-            {
-                return;
-            }
+        {
+            return;
         }
 
         // Flush remaining rows
         if !chunk_buffer.is_empty() {
             let rows = std::mem::take(&mut chunk_buffer);
             if tx
-                .send(Ok(QueryStreamEvent::Chunk {
-                    rows,
-                    chunk_index,
-                }))
+                .send(Ok(QueryStreamEvent::Chunk { rows, chunk_index }))
                 .await
                 .is_err()
             {
@@ -987,8 +972,14 @@ mod tests {
         assert_eq!(map_column_type(ColumnType::Daten), SimpleType::Date);
         assert_eq!(map_column_type(ColumnType::Timen), SimpleType::Time);
         assert_eq!(map_column_type(ColumnType::Datetime), SimpleType::Timestamp);
-        assert_eq!(map_column_type(ColumnType::Datetime4), SimpleType::Timestamp);
-        assert_eq!(map_column_type(ColumnType::Datetime2), SimpleType::Timestamp);
+        assert_eq!(
+            map_column_type(ColumnType::Datetime4),
+            SimpleType::Timestamp
+        );
+        assert_eq!(
+            map_column_type(ColumnType::Datetime2),
+            SimpleType::Timestamp
+        );
         assert_eq!(
             map_column_type(ColumnType::DatetimeOffsetn),
             SimpleType::TimestampTz

@@ -43,8 +43,8 @@ use crate::provider::{
 use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
 use crate::type_mapping::map_clickhouse_type;
 
-use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::Error;
+use kyomi_connect_protocol::QueryStreamEvent;
 
 /// Default ClickHouse HTTP port.
 const DEFAULT_PORT: u16 = 8123;
@@ -244,10 +244,12 @@ impl ClickHouseProvider {
             self.client.post(&url).body(sql.to_string()).send(),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "ClickHouse query timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "ClickHouse query timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("ClickHouse HTTP request failed: {e}")))?;
 
         Ok(response)
@@ -345,10 +347,7 @@ impl DatasourceProvider for ClickHouseProvider {
             });
 
         let status_code = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
 
         if !status_code.is_success() {
             tracing::error!(status = %status_code, error = %body, "ClickHouse query error");
@@ -393,10 +392,7 @@ impl DatasourceProvider for ClickHouseProvider {
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        let type_str = col
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let type_str = col.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         ColumnInfo {
                             name,
                             col_type: map_clickhouse_type(type_str),
@@ -425,7 +421,11 @@ impl DatasourceProvider for ClickHouseProvider {
                                     .enumerate()
                                     .map(|(i, v)| {
                                         let sanitized = sanitize_null_bytes(v.clone());
-                                        coerce_value_type(&sanitized, columns.get(i), self.server_tz_is_utc)
+                                        coerce_value_type(
+                                            &sanitized,
+                                            columns.get(i),
+                                            self.server_tz_is_utc,
+                                        )
                                     })
                                     .collect()
                             })
@@ -489,10 +489,7 @@ impl DatasourceProvider for ClickHouseProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -514,7 +511,9 @@ impl DatasourceProvider for ClickHouseProvider {
         // JSONCompactEachRowWithNamesAndTypes is SELECT-oriented; for non-SELECT
         // queries (DDL, INSERT, etc.) fall back to the default buffered path.
         if !prepared.is_select {
-            let result = self.execute_query(sql, limit, offset, include_total).await?;
+            let result = self
+                .execute_query(sql, limit, offset, include_total)
+                .await?;
             return crate::stream::query_result_to_stream(result);
         }
 
@@ -588,11 +587,8 @@ impl DatasourceProvider for ClickHouseProvider {
             let mut byte_stream = std::pin::pin!(byte_stream);
 
             loop {
-                let next = tokio::time::timeout(
-                    crate::DATASOURCE_TIMEOUT_QUERY,
-                    byte_stream.next(),
-                )
-                .await;
+                let next =
+                    tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, byte_stream.next()).await;
 
                 let bytes_item = match next {
                     Ok(Some(Ok(bytes))) => Some(bytes),
@@ -779,27 +775,23 @@ impl DatasourceProvider for ClickHouseProvider {
                         }
 
                         // Emit header if we never got any rows (empty result set).
-                        if !columns_ready {
-                            if tx
+                        if !columns_ready
+                            && tx
                                 .send(Ok(QueryStreamEvent::Header {
                                     columns: Vec::new(),
                                     total_rows,
                                 }))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
 
                         // Flush remaining rows.
                         if !chunk_buffer.is_empty() {
                             let rows = std::mem::take(&mut chunk_buffer);
                             if tx
-                                .send(Ok(QueryStreamEvent::Chunk {
-                                    rows,
-                                    chunk_index,
-                                }))
+                                .send(Ok(QueryStreamEvent::Chunk { rows, chunk_index }))
                                 .await
                                 .is_err()
                             {
@@ -865,7 +857,10 @@ fn urlencoded(s: &str) -> String {
 async fn get_total_count(provider: &ClickHouseProvider, sql: &str) -> Option<i64> {
     let count_sql = format!("SELECT COUNT(*) FROM ({sql}) AS _count_subquery");
 
-    let response = provider.execute_http(&count_sql, Some("JSONCompact")).await.ok()?;
+    let response = provider
+        .execute_http(&count_sql, Some("JSONCompact"))
+        .await
+        .ok()?;
 
     if !response.status().is_success() {
         tracing::warn!("Failed to get ClickHouse total count, continuing without it");
@@ -959,18 +954,17 @@ fn sanitize_null_bytes(value: Value) -> Value {
 }
 
 /// Regex for ClickHouse "(line X, col Y)" error pattern, compiled once.
-static CH_LINE_COL_RE: LazyLock<Regex> = LazyLock::new(||
+static CH_LINE_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\(line\s+(\d+),\s*col\s+(\d+)\)").expect("ClickHouse line/col regex")
-);
+});
 
 /// Regex for ClickHouse "(line X)" error pattern, compiled once.
 static CH_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\(line\s+(\d+)\)").expect("ClickHouse line regex"));
 
 /// Regex for ClickHouse "at position X" error pattern, compiled once.
-static CH_POSITION_RE: LazyLock<Regex> = LazyLock::new(||
-    Regex::new(r"(?i)at position\s+(\d+)").expect("ClickHouse position regex")
-);
+static CH_POSITION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)at position\s+(\d+)").expect("ClickHouse position regex"));
 
 /// Parse ClickHouse error for line/column position.
 ///
@@ -978,10 +972,7 @@ static CH_POSITION_RE: LazyLock<Regex> = LazyLock::new(||
 /// - `"Syntax error: failed at position 38 (line 4, col 1): FROM my_table"`
 /// - `"failed at position 12 ('databases'): Expected one of..."`
 /// - `"Syntax error: ... (line 19, col 25)"`
-fn parse_clickhouse_error_location(
-    error_msg: &str,
-    sql: &str,
-) -> (Option<u32>, Option<u32>) {
+fn parse_clickhouse_error_location(error_msg: &str, sql: &str) -> (Option<u32>, Option<u32>) {
     // Try "(line X, col Y)" pattern first
     if let Some(caps) = CH_LINE_COL_RE.captures(error_msg) {
         let line = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
@@ -1054,24 +1045,30 @@ mod tests {
             sanitize_null_bytes(serde_json::json!(42)),
             serde_json::json!(42)
         );
-        assert_eq!(
-            sanitize_null_bytes(Value::Bool(true)),
-            Value::Bool(true)
-        );
+        assert_eq!(sanitize_null_bytes(Value::Bool(true)), Value::Bool(true));
     }
 
     // --- Type coercion ---
 
     fn num_col(name: &str) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type: SimpleType::Number }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type: SimpleType::Number,
+        }
     }
 
     fn str_col(name: &str) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type: SimpleType::String }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type: SimpleType::String,
+        }
     }
 
     fn bool_col(name: &str) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type: SimpleType::Boolean }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type: SimpleType::Boolean,
+        }
     }
 
     #[test]
@@ -1099,7 +1096,11 @@ mod tests {
     fn coerce_string_large_uint64_to_number() {
         let col = num_col("big");
         // Value within i64 range
-        let result = coerce_value_type(&Value::String("9223372036854775807".into()), Some(&col), true);
+        let result = coerce_value_type(
+            &Value::String("9223372036854775807".into()),
+            Some(&col),
+            true,
+        );
         assert_eq!(result, serde_json::json!(9_223_372_036_854_775_807_i64));
     }
 
@@ -1113,15 +1114,27 @@ mod tests {
     #[test]
     fn coerce_string_bool_true() {
         let col = bool_col("flag");
-        assert_eq!(coerce_value_type(&Value::String("1".into()), Some(&col), true), Value::Bool(true));
-        assert_eq!(coerce_value_type(&Value::String("true".into()), Some(&col), true), Value::Bool(true));
+        assert_eq!(
+            coerce_value_type(&Value::String("1".into()), Some(&col), true),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            coerce_value_type(&Value::String("true".into()), Some(&col), true),
+            Value::Bool(true)
+        );
     }
 
     #[test]
     fn coerce_string_bool_false() {
         let col = bool_col("flag");
-        assert_eq!(coerce_value_type(&Value::String("0".into()), Some(&col), true), Value::Bool(false));
-        assert_eq!(coerce_value_type(&Value::String("false".into()), Some(&col), true), Value::Bool(false));
+        assert_eq!(
+            coerce_value_type(&Value::String("0".into()), Some(&col), true),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            coerce_value_type(&Value::String("false".into()), Some(&col), true),
+            Value::Bool(false)
+        );
     }
 
     #[test]
@@ -1152,13 +1165,20 @@ mod tests {
     }
 
     fn ts_col(name: &str) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type: SimpleType::Timestamp }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type: SimpleType::Timestamp,
+        }
     }
 
     #[test]
     fn coerce_datetime_to_iso8601_utc() {
         let col = ts_col("timestamp");
-        let result = coerce_value_type(&Value::String("2026-02-15 11:02:36".into()), Some(&col), true);
+        let result = coerce_value_type(
+            &Value::String("2026-02-15 11:02:36".into()),
+            Some(&col),
+            true,
+        );
         assert_eq!(result, Value::String("2026-02-15T11:02:36Z".into()));
     }
 
@@ -1166,7 +1186,11 @@ mod tests {
     fn coerce_datetime64_to_iso8601_utc() {
         let col = ts_col("created_at");
         // DateTime64(3) returns subsecond precision
-        let result = coerce_value_type(&Value::String("2026-02-15 11:02:36.123".into()), Some(&col), true);
+        let result = coerce_value_type(
+            &Value::String("2026-02-15 11:02:36.123".into()),
+            Some(&col),
+            true,
+        );
         assert_eq!(result, Value::String("2026-02-15T11:02:36.123Z".into()));
     }
 
@@ -1174,7 +1198,11 @@ mod tests {
     fn coerce_datetime_non_utc_no_z_suffix() {
         let col = ts_col("timestamp");
         // Non-UTC server: space→T conversion but no Z appended
-        let result = coerce_value_type(&Value::String("2026-02-15 11:02:36".into()), Some(&col), false);
+        let result = coerce_value_type(
+            &Value::String("2026-02-15 11:02:36".into()),
+            Some(&col),
+            false,
+        );
         assert_eq!(result, Value::String("2026-02-15T11:02:36".into()));
     }
 

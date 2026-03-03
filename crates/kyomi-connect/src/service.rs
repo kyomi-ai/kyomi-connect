@@ -5,7 +5,9 @@ const UNIT_PATH: &str = "/etc/systemd/system/kyomi-connect.service";
 
 pub fn install() -> anyhow::Result<()> {
     if !is_root() {
-        anyhow::bail!("Service install requires root. Run with: sudo kyomi-connect service install");
+        anyhow::bail!(
+            "Service install requires root. Run with: sudo kyomi-connect service install"
+        );
     }
 
     let binary_path = std::env::current_exe()?.canonicalize()?;
@@ -13,22 +15,22 @@ pub fn install() -> anyhow::Result<()> {
     let env_file = config_dir.join("env");
 
     // Copy user config to system location if not already present
-    if !config_dir.exists() {
-        if let Some(user_config_dir) = dirs::config_dir() {
-            let user_config = user_config_dir.join("kyomi-connect");
-            if user_config.exists() {
-                std::fs::create_dir_all(&config_dir)?;
-                for entry in std::fs::read_dir(&user_config)? {
-                    let entry = entry?;
-                    let dest = config_dir.join(entry.file_name());
-                    std::fs::copy(entry.path(), &dest)?;
-                }
-                println!(
-                    "  Copied config from {} to {}",
-                    user_config.display(),
-                    config_dir.display()
-                );
+    if !config_dir.exists()
+        && let Some(user_config_dir) = dirs::config_dir()
+    {
+        let user_config = user_config_dir.join("kyomi-connect");
+        if user_config.exists() {
+            std::fs::create_dir_all(&config_dir)?;
+            for entry in std::fs::read_dir(&user_config)? {
+                let entry = entry?;
+                let dest = config_dir.join(entry.file_name());
+                std::fs::copy(entry.path(), &dest)?;
             }
+            println!(
+                "  Copied config from {} to {}",
+                user_config.display(),
+                config_dir.display()
+            );
         }
     }
 

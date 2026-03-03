@@ -172,10 +172,12 @@ impl PostgresProvider {
             PgPool::connect_with(connect_options),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "PostgreSQL connection timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "PostgreSQL connection timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("PostgreSQL connection failed: {e}")))?;
 
         Ok(Self {
@@ -228,7 +230,7 @@ impl DatasourceProvider for PostgresProvider {
         // Execute the query with timeout
         let query_result = tokio::time::timeout(
             crate::DATASOURCE_TIMEOUT_QUERY,
-            sqlx::query(&paginated_sql).fetch_all(&self.pool),
+            sqlx::query(paginated_sql).fetch_all(&self.pool),
         )
         .await;
 
@@ -417,10 +419,7 @@ impl DatasourceProvider for PostgresProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -449,10 +448,7 @@ impl DatasourceProvider for PostgresProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -480,7 +476,10 @@ fn parse_pg_ssl_mode(mode: &str) -> PgSslMode {
         "verify-ca" => PgSslMode::VerifyCa,
         "verify-full" => PgSslMode::VerifyFull,
         _ => {
-            tracing::warn!(mode = mode, "Unknown PostgreSQL ssl_mode, defaulting to Require");
+            tracing::warn!(
+                mode = mode,
+                "Unknown PostgreSQL ssl_mode, defaulting to Require"
+            );
             PgSslMode::Require
         }
     }
@@ -577,14 +576,24 @@ fn format_pg_interval(iv: &sqlx::postgres::types::PgInterval) -> String {
         let years = iv.months / 12;
         let mons = iv.months % 12;
         if years != 0 {
-            parts.push(format!("{years} year{}", if years.abs() != 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{years} year{}",
+                if years.abs() != 1 { "s" } else { "" }
+            ));
         }
         if mons != 0 {
-            parts.push(format!("{mons} mon{}", if mons.abs() != 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{mons} mon{}",
+                if mons.abs() != 1 { "s" } else { "" }
+            ));
         }
     }
     if iv.days != 0 {
-        parts.push(format!("{} day{}", iv.days, if iv.days.abs() != 1 { "s" } else { "" }));
+        parts.push(format!(
+            "{} day{}",
+            iv.days,
+            if iv.days.abs() != 1 { "s" } else { "" }
+        ));
     }
     if iv.microseconds != 0 {
         let total_secs = iv.microseconds / 1_000_000;
@@ -602,7 +611,11 @@ fn format_pg_interval(iv: &sqlx::postgres::types::PgInterval) -> String {
 }
 
 /// Also used by the Redshift provider (which shares the PostgreSQL wire protocol).
-pub(crate) fn pg_row_value_to_json(row: &sqlx::postgres::PgRow, idx: usize, col_type: SimpleType) -> Value {
+pub(crate) fn pg_row_value_to_json(
+    row: &sqlx::postgres::PgRow,
+    idx: usize,
+    col_type: SimpleType,
+) -> Value {
     // First try to detect NULL regardless of type
     // sqlx returns an error for NULL values when try_get expects a non-Option type
     match col_type {
@@ -628,7 +641,9 @@ pub(crate) fn pg_row_value_to_json(row: &sqlx::postgres::PgRow, idx: usize, col_
             } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                 // NUMERIC/DECIMAL — lossless decode, convert to f64 for JSON
                 serde_json::json!(v.to_string().parse::<f64>().unwrap_or(0.0))
-            } else if let Ok(Some(v)) = row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx) {
+            } else if let Ok(Some(v)) =
+                row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
+            {
                 // MONEY — stored as i64 cents, convert to decimal
                 serde_json::json!(v.0 as f64 / 100.0)
             } else {
@@ -639,7 +654,9 @@ pub(crate) fn pg_row_value_to_json(row: &sqlx::postgres::PgRow, idx: usize, col_
         SimpleType::String => {
             if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
                 Value::String(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(idx) {
+            } else if let Ok(Some(v)) =
+                row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(idx)
+            {
                 // INTERVAL — format as human-readable string
                 Value::String(format_pg_interval(&v))
             } else if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
@@ -675,9 +692,7 @@ pub(crate) fn pg_row_value_to_json(row: &sqlx::postgres::PgRow, idx: usize, col_
         }
 
         SimpleType::TimestampTz => {
-            if let Ok(Some(v)) =
-                row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
-            {
+            if let Ok(Some(v)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx) {
                 Value::String(v.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             } else {
                 Value::Null
@@ -729,7 +744,10 @@ fn extract_character_position(msg: &str) -> Option<usize> {
     let pattern = "at character ";
     if let Some(idx) = msg.find(pattern) {
         let start = idx + pattern.len();
-        let num_str: String = msg[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let num_str: String = msg[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if let Ok(pos) = num_str.parse::<usize>() {
             // PostgreSQL positions are 1-indexed
             return Some(pos);
@@ -769,8 +787,14 @@ mod tests {
         assert!(matches!(parse_pg_ssl_mode("disable"), PgSslMode::Disable));
         assert!(matches!(parse_pg_ssl_mode("prefer"), PgSslMode::Prefer));
         assert!(matches!(parse_pg_ssl_mode("require"), PgSslMode::Require));
-        assert!(matches!(parse_pg_ssl_mode("verify-ca"), PgSslMode::VerifyCa));
-        assert!(matches!(parse_pg_ssl_mode("verify-full"), PgSslMode::VerifyFull));
+        assert!(matches!(
+            parse_pg_ssl_mode("verify-ca"),
+            PgSslMode::VerifyCa
+        ));
+        assert!(matches!(
+            parse_pg_ssl_mode("verify-full"),
+            PgSslMode::VerifyFull
+        ));
         // Unknown defaults to Require
         assert!(matches!(parse_pg_ssl_mode("unknown"), PgSslMode::Require));
     }

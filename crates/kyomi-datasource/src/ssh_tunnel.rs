@@ -79,7 +79,11 @@ impl SshTunnel {
         target_host: &str,
         target_port: u16,
     ) -> kyomi_connect_protocol::Result<Self> {
-        let ssh_port = if ssh_port == 0 { DEFAULT_SSH_PORT } else { ssh_port };
+        let ssh_port = if ssh_port == 0 {
+            DEFAULT_SSH_PORT
+        } else {
+            ssh_port
+        };
 
         tracing::info!(
             ssh_host = ssh_host,
@@ -102,18 +106,17 @@ impl SshTunnel {
             russh::client::connect(config, &addr, handler),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "SSH connection to {addr} timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "SSH connection to {addr} timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("SSH connection to {addr} failed: {e}")))?;
 
         // Authenticate with the private key
         let username = ssh_username.to_string();
-        let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(
-            Arc::new(private_key),
-            None,
-        );
+        let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
         let auth_result = handle
             .authenticate_publickey(&username, key_with_alg)
             .await
@@ -128,11 +131,12 @@ impl SshTunnel {
         tracing::info!("SSH authentication successful");
 
         // Bind local TCP listener on random port
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to bind local SSH tunnel listener: {e}")))?;
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
+            Error::Internal(format!("Failed to bind local SSH tunnel listener: {e}"))
+        })?;
 
-        let local_addr = listener.local_addr()
+        let local_addr = listener
+            .local_addr()
             .map_err(|e| Error::Internal(format!("Failed to get local address: {e}")))?;
 
         tracing::info!(
@@ -180,11 +184,7 @@ impl SshTunnel {
 
         if let Some(handle) = self.task_handle.take() {
             // Give the task a moment to shut down
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                handle,
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
     }
 }
@@ -385,9 +385,7 @@ impl SshTunnelConfig {
 
         let host = match config.get("ssh_host").and_then(|v| v.as_str()) {
             Some(h) if !h.is_empty() => h.to_string(),
-            _ => return Some(Err(Error::Provider(
-                "SSH tunnel requires ssh_host".into(),
-            ))),
+            _ => return Some(Err(Error::Provider("SSH tunnel requires ssh_host".into()))),
         };
 
         let port = config
@@ -398,16 +396,20 @@ impl SshTunnelConfig {
 
         let username = match config.get("ssh_username").and_then(|v| v.as_str()) {
             Some(u) if !u.is_empty() => u.to_string(),
-            _ => return Some(Err(Error::Provider(
-                "SSH tunnel requires ssh_username".into(),
-            ))),
+            _ => {
+                return Some(Err(Error::Provider(
+                    "SSH tunnel requires ssh_username".into(),
+                )));
+            }
         };
 
         let private_key = match config.get("ssh_private_key").and_then(|v| v.as_str()) {
             Some(k) if !k.is_empty() => k.to_string(),
-            _ => return Some(Err(Error::Provider(
-                "SSH tunnel requires ssh_private_key".into(),
-            ))),
+            _ => {
+                return Some(Err(Error::Provider(
+                    "SSH tunnel requires ssh_private_key".into(),
+                )));
+            }
         };
 
         Some(Ok(Self {

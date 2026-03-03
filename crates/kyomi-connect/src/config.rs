@@ -125,16 +125,14 @@ impl ConnectConfig {
             "x": x,
             "y": y,
         });
-        let decoding_key =
-            jsonwebtoken::DecodingKey::from_jwk(&serde_json::from_value(ec_key)?)?;
+        let decoding_key = jsonwebtoken::DecodingKey::from_jwk(&serde_json::from_value(ec_key)?)?;
 
         // Now verify the token properly
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.validate_exp = false; // Connect tokens don't expire (revoked via jti)
         validation.set_required_spec_claims::<&str>(&[]);
-        let token_data =
-            jsonwebtoken::decode::<ConnectClaims>(&token, &decoding_key, &validation)
-                .map_err(|e| anyhow::anyhow!("JWT verification failed: {e}"))?;
+        let token_data = jsonwebtoken::decode::<ConnectClaims>(&token, &decoding_key, &validation)
+            .map_err(|e| anyhow::anyhow!("JWT verification failed: {e}"))?;
 
         let claims = token_data.claims;
         tracing::info!(
@@ -172,7 +170,11 @@ impl ConnectConfig {
         let db_ssl_ca = read_env_or_file("DB_SSL_CA")
             .or_else(|| file_config.as_ref().and_then(|cf| cf.db_ssl_ca.clone()));
         let health_port: u16 = read_env_or_file("HEALTH_PORT")
-            .or_else(|| file_config.as_ref().and_then(|cf| cf.health_port.map(|p| p.to_string())))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|cf| cf.health_port.map(|p| p.to_string()))
+            })
             .unwrap_or_else(|| "9090".to_string())
             .parse()
             .map_err(|_| anyhow::anyhow!("HEALTH_PORT must be a valid port number"))?;

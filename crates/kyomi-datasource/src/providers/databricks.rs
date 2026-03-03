@@ -38,13 +38,11 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::provider::{
-    ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus,
-};
+use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::type_mapping::map_databricks_type;
 
-use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::Error;
+use kyomi_connect_protocol::QueryStreamEvent;
 
 /// Maximum time to wait for a statement to complete before giving up.
 const STATEMENT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -97,9 +95,11 @@ impl DatabricksProvider {
         // Extract warehouse ID from http_path
         // Format: "/sql/1.0/warehouses/{warehouse_id}"
         let warehouse_id = extract_warehouse_id(http_path)
-            .ok_or_else(|| Error::Provider(format!(
-                "Could not extract warehouse ID from http_path: {http_path}"
-            )))?
+            .ok_or_else(|| {
+                Error::Provider(format!(
+                    "Could not extract warehouse ID from http_path: {http_path}"
+                ))
+            })?
             .to_string();
 
         let catalog = connection_config
@@ -145,7 +145,9 @@ impl DatabricksProvider {
             // a prior ensure_valid_oauth_credentials pass (e.g., tests).
             let client = crate::http_client()?;
             let token_url = format!("https://{server_hostname}/oidc/v1/token");
-            exchange_m2m_token(&client, &token_url, client_id, client_secret).await?.access_token
+            exchange_m2m_token(&client, &token_url, client_id, client_secret)
+                .await?
+                .access_token
         } else {
             return Err(Error::Provider(
                 "Databricks requires access_token, oauth_access_token, or client_id + client_secret".into(),
@@ -173,10 +175,7 @@ impl DatabricksProvider {
 
     /// Build the SQL statements API URL.
     fn statements_url(&self) -> String {
-        format!(
-            "https://{}/api/2.0/sql/statements",
-            self.server_hostname
-        )
+        format!("https://{}/api/2.0/sql/statements", self.server_hostname)
     }
 
     /// Build the URL for getting a specific statement's status.
@@ -225,18 +224,18 @@ impl DatabricksProvider {
                 .send(),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "Databricks statement timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "Databricks statement timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("Databricks HTTP request failed: {e}")))?;
 
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| Error::Internal(format!(
-                "Failed to parse Databricks response: {e}"
-            )))?;
+            .map_err(|e| Error::Internal(format!("Failed to parse Databricks response: {e}")))?;
 
         // Check statement status
         let state = response_body
@@ -261,9 +260,11 @@ impl DatabricksProvider {
                 let statement_id = response_body
                     .get("statement_id")
                     .and_then(|id| id.as_str())
-                    .ok_or_else(|| Error::Internal(
-                        "Databricks response missing statement_id for polling".into(),
-                    ))?;
+                    .ok_or_else(|| {
+                        Error::Internal(
+                            "Databricks response missing statement_id for polling".into(),
+                        )
+                    })?;
                 self.poll_statement(statement_id).await
             }
             _ => {
@@ -299,12 +300,9 @@ impl DatabricksProvider {
                 .await
                 .map_err(|e| Error::Internal(format!("Databricks poll failed: {e}")))?;
 
-            let body: Value = response
-                .json()
-                .await
-                .map_err(|e| Error::Internal(format!(
-                    "Failed to parse Databricks poll response: {e}"
-                )))?;
+            let body: Value = response.json().await.map_err(|e| {
+                Error::Internal(format!("Failed to parse Databricks poll response: {e}"))
+            })?;
 
             let state = body
                 .get("status")
@@ -362,23 +360,20 @@ impl DatabricksProvider {
         while let Some(chunk_index) = next_chunk {
             let url = self.chunk_url(statement_id, chunk_index);
 
-            let fetch_result = tokio::time::timeout(
-                crate::DATASOURCE_TIMEOUT_QUERY,
-                async {
-                    let response = self
-                        .client
-                        .get(&url)
-                        .bearer_auth(&self.token)
-                        .send()
-                        .await
-                        .map_err(|e| format!("Failed to fetch Databricks chunk {chunk_index}: {e}"))?;
-                    let body: Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("Failed to parse Databricks chunk {chunk_index}: {e}"))?;
-                    Ok::<Value, String>(body)
-                },
-            )
+            let fetch_result = tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, async {
+                let response = self
+                    .client
+                    .get(&url)
+                    .bearer_auth(&self.token)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to fetch Databricks chunk {chunk_index}: {e}"))?;
+                let body: Value = response
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse Databricks chunk {chunk_index}: {e}"))?;
+                Ok::<Value, String>(body)
+            })
             .await;
 
             let chunk_body: Value = match fetch_result {
@@ -478,10 +473,7 @@ impl DatasourceProvider for DatabricksProvider {
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        let type_text = col
-                            .get("type_text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let type_text = col.get("type_text").and_then(|t| t.as_str()).unwrap_or("");
                         ColumnInfo {
                             name,
                             col_type: map_databricks_type(type_text),
@@ -597,10 +589,7 @@ impl DatasourceProvider for DatabricksProvider {
                             .and_then(|n| n.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        let type_text = col
-                            .get("type_text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let type_text = col.get("type_text").and_then(|t| t.as_str()).unwrap_or("");
                         ColumnInfo {
                             name,
                             col_type: map_databricks_type(type_text),
@@ -678,26 +667,25 @@ impl DatasourceProvider for DatabricksProvider {
                     server_hostname, statement_id
                 );
 
-                let fetch_result = tokio::time::timeout(
-                    crate::DATASOURCE_TIMEOUT_QUERY,
-                    async {
-                        let response = client
+                let fetch_result = tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, async {
+                    let response =
+                        client
                             .get(&url)
                             .bearer_auth(&token)
                             .send()
                             .await
-                            .map_err(|e| Error::Internal(format!(
-                                "Failed to fetch Databricks chunk {api_chunk_index}: {e}"
-                            )))?;
-                        let body: Value = response
-                            .json()
-                            .await
-                            .map_err(|e| Error::Internal(format!(
-                                "Failed to parse Databricks chunk {api_chunk_index}: {e}"
-                            )))?;
-                        Ok::<Value, Error>(body)
-                    },
-                )
+                            .map_err(|e| {
+                                Error::Internal(format!(
+                                    "Failed to fetch Databricks chunk {api_chunk_index}: {e}"
+                                ))
+                            })?;
+                    let body: Value = response.json().await.map_err(|e| {
+                        Error::Internal(format!(
+                            "Failed to parse Databricks chunk {api_chunk_index}: {e}"
+                        ))
+                    })?;
+                    Ok::<Value, Error>(body)
+                })
                 .await;
 
                 let chunk_body: Value = match fetch_result {
@@ -830,21 +818,24 @@ pub(crate) async fn exchange_m2m_token(
         client.post(token_url).form(&params).send(),
     )
     .await
-    .map_err(|_| Error::Internal(format!(
-        "Databricks M2M token exchange timed out after {}s",
-        crate::OAUTH_REFRESH_TIMEOUT.as_secs()
-    )))?
-    .map_err(|e| Error::Internal(format!(
-        "Databricks M2M token exchange HTTP request failed: {e}"
-    )))?;
+    .map_err(|_| {
+        Error::Internal(format!(
+            "Databricks M2M token exchange timed out after {}s",
+            crate::OAUTH_REFRESH_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|e| {
+        Error::Internal(format!(
+            "Databricks M2M token exchange HTTP request failed: {e}"
+        ))
+    })?;
 
     let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| Error::Internal(format!(
+    let body: Value = response.json().await.map_err(|e| {
+        Error::Internal(format!(
             "Failed to parse Databricks M2M token response: {e}"
-        )))?;
+        ))
+    })?;
 
     if !status.is_success() {
         let error = body
@@ -865,13 +856,11 @@ pub(crate) async fn exchange_m2m_token(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .ok_or_else(|| Error::Internal(
-            "Databricks M2M token response missing access_token".into(),
-        ))?;
+        .ok_or_else(|| {
+            Error::Internal("Databricks M2M token response missing access_token".into())
+        })?;
 
-    let expires_in = body
-        .get("expires_in")
-        .and_then(|v| v.as_i64());
+    let expires_in = body.get("expires_in").and_then(|v| v.as_i64());
 
     Ok(M2mTokenResult {
         access_token,
@@ -971,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn m2m_token_exchange_success() {
-        use wiremock::matchers::{method, path, body_string_contains};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
@@ -994,13 +983,8 @@ mod tests {
         let client = reqwest::Client::new();
         let token_url = format!("{}/oidc/v1/token", mock_server.uri());
 
-        let result = exchange_m2m_token(
-            &client,
-            &token_url,
-            "test-client-id",
-            "test-client-secret",
-        )
-        .await;
+        let result =
+            exchange_m2m_token(&client, &token_url, "test-client-id", "test-client-secret").await;
 
         let token_result = result.expect("exchange should succeed");
         assert_eq!(token_result.access_token, "m2m-access-token-123");
@@ -1027,13 +1011,7 @@ mod tests {
         let client = reqwest::Client::new();
         let token_url = format!("{}/oidc/v1/token", mock_server.uri());
 
-        let result = exchange_m2m_token(
-            &client,
-            &token_url,
-            "bad-client-id",
-            "bad-secret",
-        )
-        .await;
+        let result = exchange_m2m_token(&client, &token_url, "bad-client-id", "bad-secret").await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1068,13 +1046,7 @@ mod tests {
         let client = reqwest::Client::new();
         let token_url = format!("{}/oidc/v1/token", mock_server.uri());
 
-        let result = exchange_m2m_token(
-            &client,
-            &token_url,
-            "test-client-id",
-            "test-secret",
-        )
-        .await;
+        let result = exchange_m2m_token(&client, &token_url, "test-client-id", "test-secret").await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1106,13 +1078,7 @@ mod tests {
         let client = reqwest::Client::new();
         let token_url = format!("{}/oidc/v1/token", mock_server.uri());
 
-        let result = exchange_m2m_token(
-            &client,
-            &token_url,
-            "test-client-id",
-            "test-secret",
-        )
-        .await;
+        let result = exchange_m2m_token(&client, &token_url, "test-client-id", "test-secret").await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

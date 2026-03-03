@@ -31,7 +31,7 @@ pub mod type_mapping;
 // Re-exports — convenient access to key types
 // ---------------------------------------------------------------------------
 
-pub use factory::{create_provider, resolve_shared_credentials, UserContext};
+pub use factory::{UserContext, create_provider, resolve_shared_credentials};
 pub use oauth_refresh::ensure_valid_oauth_credentials;
 pub use provider::{
     ColumnInfo, DatasourceProvider, DiscoveryResult, DryRunResult, QueryResult, QueryStatus,
@@ -63,5 +63,7 @@ pub fn http_client() -> kyomi_connect_protocol::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("Kyomi/1.0")
         .build()
-        .map_err(|e| kyomi_connect_protocol::Error::Internal(format!("Failed to build HTTP client: {e}")))
+        .map_err(|e| {
+            kyomi_connect_protocol::Error::Internal(format!("Failed to build HTTP client: {e}"))
+        })
 }

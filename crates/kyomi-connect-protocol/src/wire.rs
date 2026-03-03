@@ -123,13 +123,9 @@ pub enum ConnectResponseBody {
     /// Successful result. The `result` value is a JSON-serialized typed result
     /// (QueryResult, DryRunResult, CatalogResult, or a simple boolean for
     /// test_connection).
-    Result {
-        result: serde_json::Value,
-    },
+    Result { result: serde_json::Value },
     /// Error response with a human-readable message.
-    Error {
-        error: String,
-    },
+    Error { error: String },
     /// First streaming event: column metadata and optional row count estimate.
     StreamHeader {
         /// Column definitions for the result set.
@@ -505,8 +501,14 @@ mod tests {
             id: "sh-1".into(),
             body: ConnectResponseBody::StreamHeader {
                 columns: vec![
-                    ColumnInfo { name: "id".into(), col_type: SimpleType::Number },
-                    ColumnInfo { name: "name".into(), col_type: SimpleType::String },
+                    ColumnInfo {
+                        name: "id".into(),
+                        col_type: SimpleType::Number,
+                    },
+                    ColumnInfo {
+                        name: "name".into(),
+                        col_type: SimpleType::String,
+                    },
                 ],
                 total_rows: Some(1000),
             },
@@ -541,10 +543,7 @@ mod tests {
         let resp = ConnectResponse {
             id: "sc-1".into(),
             body: ConnectResponseBody::StreamChunk {
-                rows: vec![
-                    vec![json!(1), json!("Alice")],
-                    vec![json!(2), json!("Bob")],
-                ],
+                rows: vec![vec![json!(1), json!("Alice")], vec![json!(2), json!("Bob")]],
                 chunk_index: 0,
             },
         };
@@ -602,9 +601,10 @@ mod tests {
         let resp = ConnectResponse {
             id: "rt-sh".into(),
             body: ConnectResponseBody::StreamHeader {
-                columns: vec![
-                    ColumnInfo { name: "id".into(), col_type: SimpleType::Number },
-                ],
+                columns: vec![ColumnInfo {
+                    name: "id".into(),
+                    col_type: SimpleType::Number,
+                }],
                 total_rows: Some(42),
             },
         };
@@ -613,7 +613,10 @@ mod tests {
         let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "rt-sh");
         match parsed.body {
-            ConnectResponseBody::StreamHeader { columns, total_rows } => {
+            ConnectResponseBody::StreamHeader {
+                columns,
+                total_rows,
+            } => {
                 assert_eq!(columns.len(), 1);
                 assert_eq!(columns[0].name, "id");
                 assert_eq!(total_rows, Some(42));
@@ -881,13 +884,14 @@ mod tests {
         assert_eq!(resp_parsed.id, "dc-1");
         match resp_parsed.body {
             ConnectResponseBody::Result { result } => {
-                let parsed_catalog: CatalogResult =
-                    serde_json::from_value(result).unwrap();
+                let parsed_catalog: CatalogResult = serde_json::from_value(result).unwrap();
                 assert_eq!(parsed_catalog.containers.len(), 1);
                 assert_eq!(parsed_catalog.containers[0].name, "public");
                 assert_eq!(parsed_catalog.containers[0].tables[0].name, "users");
                 assert_eq!(
-                    parsed_catalog.containers[0].tables[0].native_type.as_deref(),
+                    parsed_catalog.containers[0].tables[0]
+                        .native_type
+                        .as_deref(),
                     Some("BASE TABLE")
                 );
                 assert_eq!(parsed_catalog.containers[0].tables[0].columns.len(), 2);
@@ -947,9 +951,7 @@ mod tests {
 
     #[test]
     fn catalog_result_empty_roundtrip() {
-        let catalog = CatalogResult {
-            containers: vec![],
-        };
+        let catalog = CatalogResult { containers: vec![] };
         let json = serde_json::to_string(&catalog).unwrap();
         let parsed: CatalogResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.containers.is_empty());
@@ -1058,13 +1060,19 @@ mod tests {
     fn response_missing_type_tag_fails() {
         let raw = r#"{"id": "x-3"}"#;
         let result: Result<ConnectResponse, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for response with no type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for response with no type tag"
+        );
     }
 
     #[test]
     fn response_unknown_type_tag_fails() {
         let raw = r#"{"id": "x-4", "type": "unknown_variant"}"#;
         let result: Result<ConnectResponse, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for unknown type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for unknown type tag"
+        );
     }
 }

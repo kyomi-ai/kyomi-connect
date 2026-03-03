@@ -41,16 +41,14 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use regex::Regex;
+use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs8::EncodePublicKey;
-use rsa::RsaPrivateKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::provider::{
-    ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus,
-};
+use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::type_mapping::map_snowflake_type_code;
 
 use kyomi_connect_protocol::Error;
@@ -170,9 +168,11 @@ impl SnowflakeProvider {
             let username = credentials
                 .get("username")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Provider(
-                    "Snowflake requires username for key-pair authentication".into(),
-                ))?;
+                .ok_or_else(|| {
+                    Error::Provider(
+                        "Snowflake requires username for key-pair authentication".into(),
+                    )
+                })?;
 
             let passphrase = credentials
                 .get("private_key_passphrase")
@@ -193,16 +193,20 @@ impl SnowflakeProvider {
             let username = credentials
                 .get("username")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Provider(
-                    "Snowflake requires username for password authentication".into(),
-                ))?;
+                .ok_or_else(|| {
+                    Error::Provider(
+                        "Snowflake requires username for password authentication".into(),
+                    )
+                })?;
 
             let password = credentials
                 .get("password")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Provider(
-                    "Snowflake requires password for password authentication".into(),
-                ))?;
+                .ok_or_else(|| {
+                    Error::Provider(
+                        "Snowflake requires password for password authentication".into(),
+                    )
+                })?;
 
             tracing::info!(
                 account = account,
@@ -260,7 +264,8 @@ impl SnowflakeProvider {
             }
         }
 
-        let mut request = self.client
+        let mut request = self
+            .client
             .post(self.statements_url())
             .bearer_auth(&self.token)
             .header("Content-Type", "application/json")
@@ -268,22 +273,19 @@ impl SnowflakeProvider {
 
         // For key-pair JWT auth, tell Snowflake the token type
         if self.auth_type == AuthType::KeypairJwt {
-            request = request.header(
-                "X-Snowflake-Authorization-Token-Type",
-                "KEYPAIR_JWT",
-            );
+            request = request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
         }
 
-        let response = tokio::time::timeout(
-            crate::DATASOURCE_TIMEOUT_QUERY,
-            request.json(&body).send(),
-        )
-        .await
-        .map_err(|_| Error::Internal(format!(
-            "Snowflake statement timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-        )))?
-        .map_err(|e| Error::Internal(format!("Snowflake HTTP request failed: {e}")))?;
+        let response =
+            tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, request.json(&body).send())
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "Snowflake statement timed out after {}s",
+                        crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                    ))
+                })?
+                .map_err(|e| Error::Internal(format!("Snowflake HTTP request failed: {e}")))?;
 
         let status = response.status();
         let response_body: Value = response
@@ -353,10 +355,7 @@ impl SnowflakeProvider {
                 .header("Accept", "application/json");
 
             if self.auth_type == AuthType::KeypairJwt {
-                request = request.header(
-                    "X-Snowflake-Authorization-Token-Type",
-                    "KEYPAIR_JWT",
-                );
+                request = request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
             }
 
             let response = request
@@ -364,15 +363,11 @@ impl SnowflakeProvider {
                 .await
                 .map_err(|e| Error::Internal(format!("Snowflake poll failed: {e}")))?;
 
-            let body: Value = response
-                .json()
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to parse Snowflake poll response: {e}")))?;
+            let body: Value = response.json().await.map_err(|e| {
+                Error::Internal(format!("Failed to parse Snowflake poll response: {e}"))
+            })?;
 
-            let code = body
-                .get("code")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
 
             // "333334" = still running
             if code == "333334" {
@@ -380,10 +375,7 @@ impl SnowflakeProvider {
             }
 
             // Check for error
-            let status = body
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
             if status == "FAILED_WITH_ERROR" {
                 let msg = body
                     .get("message")
@@ -421,32 +413,29 @@ impl SnowflakeProvider {
             .header("Accept", "application/json");
 
         if auth_type == AuthType::KeypairJwt {
-            request = request.header(
-                "X-Snowflake-Authorization-Token-Type",
-                "KEYPAIR_JWT",
-            );
+            request = request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
         }
 
-        let response = tokio::time::timeout(
-            crate::DATASOURCE_TIMEOUT_QUERY,
-            request.send(),
-        )
-        .await
-        .map_err(|_| Error::Internal(format!(
-            "Snowflake partition {partition_index} fetch timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-        )))?
-        .map_err(|e| Error::Internal(format!(
-            "Snowflake partition {partition_index} request failed: {e}"
-        )))?;
+        let response = tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, request.send())
+            .await
+            .map_err(|_| {
+                Error::Internal(format!(
+                    "Snowflake partition {partition_index} fetch timed out after {}s",
+                    crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Snowflake partition {partition_index} request failed: {e}"
+                ))
+            })?;
 
         let status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| Error::Internal(format!(
+        let body: Value = response.json().await.map_err(|e| {
+            Error::Internal(format!(
                 "Failed to parse Snowflake partition {partition_index} response: {e}"
-            )))?;
+            ))
+        })?;
 
         if status.is_client_error() || status.is_server_error() {
             let msg = body
@@ -499,7 +488,7 @@ impl DatasourceProvider for SnowflakeProvider {
             "Executing Snowflake query"
         );
 
-        let result = match self.submit_statement(&paginated_sql).await {
+        let result = match self.submit_statement(paginated_sql).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "Snowflake query error");
@@ -545,10 +534,7 @@ impl DatasourceProvider for SnowflakeProvider {
                                     .unwrap_or(crate::provider::SimpleType::Unknown)
                             });
 
-                        ColumnInfo {
-                            name,
-                            col_type,
-                        }
+                        ColumnInfo { name, col_type }
                     })
                     .collect()
             })
@@ -560,11 +546,7 @@ impl DatasourceProvider for SnowflakeProvider {
             .and_then(|d| d.as_array())
             .map(|data| {
                 data.iter()
-                    .map(|row| {
-                        row.as_array()
-                            .cloned()
-                            .unwrap_or_default()
-                    })
+                    .map(|row| row.as_array().cloned().unwrap_or_default())
                     .collect()
             })
             .unwrap_or_default();
@@ -598,7 +580,10 @@ impl DatasourceProvider for SnowflakeProvider {
     }
 
     async fn list_databases(&self) -> crate::provider::DiscoveryResult {
-        match self.execute_query("SHOW DATABASES", None, None, false).await {
+        match self
+            .execute_query("SHOW DATABASES", None, None, false)
+            .await
+        {
             Ok(result) => {
                 let items: Vec<String> = result
                     .rows
@@ -630,7 +615,10 @@ impl DatasourceProvider for SnowflakeProvider {
     }
 
     async fn list_warehouses(&self) -> crate::provider::DiscoveryResult {
-        match self.execute_query("SHOW WAREHOUSES", None, None, false).await {
+        match self
+            .execute_query("SHOW WAREHOUSES", None, None, false)
+            .await
+        {
             Ok(result) => {
                 let items: Vec<String> = result
                     .rows
@@ -898,9 +886,7 @@ fn generate_keypair_jwt(
     let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(
         export_unencrypted_pkcs8_pem(&private_key)?.as_bytes(),
     )
-    .map_err(|e| Error::Internal(format!(
-        "Failed to create JWT encoding key: {e}"
-    )))?;
+    .map_err(|e| Error::Internal(format!("Failed to create JWT encoding key: {e}")))?;
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     let jwt = jsonwebtoken::encode(&header, &claims, &encoding_key)
@@ -924,28 +910,19 @@ fn parse_rsa_private_key(
 
     if trimmed.contains("ENCRYPTED PRIVATE KEY") {
         // Encrypted PKCS#8 format
-        let password = passphrase.ok_or_else(|| Error::Provider(
-            "Private key is encrypted but no passphrase was provided".into(),
-        ))?;
-        RsaPrivateKey::from_pkcs8_encrypted_pem(trimmed, password).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to decrypt PKCS#8 private key: {e}"
-            ))
-        })
+        let password = passphrase.ok_or_else(|| {
+            Error::Provider("Private key is encrypted but no passphrase was provided".into())
+        })?;
+        RsaPrivateKey::from_pkcs8_encrypted_pem(trimmed, password)
+            .map_err(|e| Error::Internal(format!("Failed to decrypt PKCS#8 private key: {e}")))
     } else if trimmed.contains("RSA PRIVATE KEY") {
         // PKCS#1 (traditional RSA format)
-        RsaPrivateKey::from_pkcs1_pem(trimmed).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to parse PKCS#1 RSA private key: {e}"
-            ))
-        })
+        RsaPrivateKey::from_pkcs1_pem(trimmed)
+            .map_err(|e| Error::Internal(format!("Failed to parse PKCS#1 RSA private key: {e}")))
     } else {
         // Unencrypted PKCS#8 format
-        RsaPrivateKey::from_pkcs8_pem(trimmed).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to parse PKCS#8 private key: {e}"
-            ))
-        })
+        RsaPrivateKey::from_pkcs8_pem(trimmed)
+            .map_err(|e| Error::Internal(format!("Failed to parse PKCS#8 private key: {e}")))
     }
 }
 
@@ -966,9 +943,7 @@ fn compute_public_key_fingerprint(
     // Encode the public key as DER (SubjectPublicKeyInfo / SPKI format)
     let der_bytes = public_key
         .to_public_key_der()
-        .map_err(|e| Error::Internal(format!(
-            "Failed to encode public key as DER: {e}"
-        )))?;
+        .map_err(|e| Error::Internal(format!("Failed to encode public key as DER: {e}")))?;
 
     // SHA-256 hash of the DER bytes
     let hash = Sha256::digest(der_bytes.as_ref());
@@ -1004,9 +979,7 @@ fn export_unencrypted_pkcs8_pem(
     private_key
         .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
         .map(|pem| pem.to_string())
-        .map_err(|e| Error::Internal(format!(
-            "Failed to export private key as PKCS#8 PEM: {e}"
-        )))
+        .map_err(|e| Error::Internal(format!("Failed to export private key as PKCS#8 PEM: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,9 +996,7 @@ async fn login_password(
     username: &str,
     password: &str,
 ) -> kyomi_connect_protocol::Result<String> {
-    let url = format!(
-        "https://{account}.snowflakecomputing.com/session/v1/login-request"
-    );
+    let url = format!("https://{account}.snowflakecomputing.com/session/v1/login-request");
 
     let body = serde_json::json!({
         "data": {
@@ -1045,10 +1016,12 @@ async fn login_password(
             .send(),
     )
     .await
-    .map_err(|_| Error::Internal(format!(
-        "Snowflake login timed out after {}s",
-        crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-    )))?
+    .map_err(|_| {
+        Error::Internal(format!(
+            "Snowflake login timed out after {}s",
+            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+        ))
+    })?
     .map_err(|e| Error::Internal(format!("Snowflake login request failed: {e}")))?;
 
     let response_body: Value = response
@@ -1105,8 +1078,8 @@ async fn get_total_count(provider: &SnowflakeProvider, sql: &str) -> Option<i64>
 fn snowflake_type_name_to_code(type_name: &str) -> Option<i32> {
     let upper = type_name.to_uppercase();
     match upper.as_str() {
-        "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT"
-        | "SMALLINT" | "TINYINT" => Some(0),
+        "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
+        | "TINYINT" => Some(0),
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Some(1),
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" => Some(2),
         "DATE" => Some(3),
@@ -1139,8 +1112,8 @@ fn map_snowflake_type_name(type_name: &str) -> crate::provider::SimpleType {
     match base {
         "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
         | "TINYINT" | "FLOAT" | "DOUBLE" | "REAL" => SimpleType::Number,
-        "VARCHAR" | "CHAR" | "STRING" | "TEXT" | "BINARY" | "VARBINARY" | "VARIANT"
-        | "OBJECT" | "ARRAY" => SimpleType::String,
+        "VARCHAR" | "CHAR" | "STRING" | "TEXT" | "BINARY" | "VARBINARY" | "VARIANT" | "OBJECT"
+        | "ARRAY" => SimpleType::String,
         "BOOLEAN" => SimpleType::Boolean,
         "DATE" => SimpleType::Date,
         "TIME" => SimpleType::Time,
@@ -1233,7 +1206,11 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
 
         // JWT has three dot-separated parts
         let parts: Vec<&str> = jwt.split('.').collect();
-        assert_eq!(parts.len(), 3, "JWT should have 3 parts: header.payload.signature");
+        assert_eq!(
+            parts.len(),
+            3,
+            "JWT should have 3 parts: header.payload.signature"
+        );
 
         // Decode header (base64url)
         let header_json = BASE64_STANDARD
@@ -1247,14 +1224,12 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
         let payload_json = BASE64_STANDARD
             .decode(pad_base64url(parts[1]))
             .expect("payload should be valid base64");
-        let payload: Value =
-            serde_json::from_slice(&payload_json).expect("payload should be JSON");
+        let payload: Value = serde_json::from_slice(&payload_json).expect("payload should be JSON");
 
         // Verify claims
         let iss = payload["iss"].as_str().expect("iss claim");
-        let expected_iss = format!(
-            "XY12345-US-EAST-1.TESTUSER.SHA256:{TEST_KEY_EXPECTED_FINGERPRINT}"
-        );
+        let expected_iss =
+            format!("XY12345-US-EAST-1.TESTUSER.SHA256:{TEST_KEY_EXPECTED_FINGERPRINT}");
         assert_eq!(
             iss, expected_iss,
             "iss should be normalized account.user.SHA256:fingerprint"
@@ -1298,8 +1273,7 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
 
     #[test]
     fn compute_public_key_fingerprint_is_deterministic() {
-        let key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PKCS8)
-            .expect("parse test key");
+        let key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PKCS8).expect("parse test key");
 
         let fp1 = compute_public_key_fingerprint(&key).expect("fingerprint 1");
         let fp2 = compute_public_key_fingerprint(&key).expect("fingerprint 2");
@@ -1316,8 +1290,7 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
         // Verify the fingerprint exactly matches the value computed by openssl:
         //   openssl rsa -in key.pem -pubout -outform DER 2>/dev/null \
         //     | openssl dgst -sha256 -binary | openssl enc -base64
-        let key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PKCS8)
-            .expect("parse test key");
+        let key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PKCS8).expect("parse test key");
 
         let fp = compute_public_key_fingerprint(&key).expect("fingerprint");
 

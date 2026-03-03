@@ -5,9 +5,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
 use axum::extract::Query;
 use axum::response::Html;
-use axum::Router;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -45,41 +45,40 @@ pub async fn start() -> anyhow::Result<CallbackServer> {
     let token_tx = Arc::new(Mutex::new(Some(token_tx)));
 
     // Allow browser fetch() from any origin (the setup page is on app.kyomi.ai)
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any);
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any);
 
-    let app = Router::new().route(
-        "/callback",
-        axum::routing::get(move |Query(params): Query<CallbackParams>| {
-            let expected = expected_state.clone();
-            let tx = token_tx.clone();
-            async move {
-                // Validate state parameter (CSRF protection)
-                let provided_state = match params.state {
-                    Some(s) => s,
-                    None => return Html(error_page("Missing state parameter.")),
-                };
+    let app = Router::new()
+        .route(
+            "/callback",
+            axum::routing::get(move |Query(params): Query<CallbackParams>| {
+                let expected = expected_state.clone();
+                let tx = token_tx.clone();
+                async move {
+                    // Validate state parameter (CSRF protection)
+                    let provided_state = match params.state {
+                        Some(s) => s,
+                        None => return Html(error_page("Missing state parameter.")),
+                    };
 
-                if provided_state != expected {
-                    return Html(error_page("Invalid state parameter. Please try again."));
+                    if provided_state != expected {
+                        return Html(error_page("Invalid state parameter. Please try again."));
+                    }
+
+                    let token = match params.token {
+                        Some(t) if !t.is_empty() => t,
+                        _ => return Html(error_page("Missing or empty token.")),
+                    };
+
+                    // Send token to the waiting CLI task
+                    if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let _ = sender.send(token);
+                    }
+
+                    Html(success_page())
                 }
-
-                let token = match params.token {
-                    Some(t) if !t.is_empty() => t,
-                    _ => return Html(error_page("Missing or empty token.")),
-                };
-
-                // Send token to the waiting CLI task
-                if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    let _ = sender.send(token);
-                }
-
-                Html(success_page())
-            }
-        }),
-    )
-    .layer(cors);
+            }),
+        )
+        .layer(cors);
 
     // Spawn the server — it runs until the process exits
     tokio::spawn(async move {

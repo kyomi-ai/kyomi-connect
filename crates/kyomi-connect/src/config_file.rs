@@ -135,10 +135,8 @@ mod tests {
 
     #[test]
     fn save_to_writes_config_and_sets_permissions() {
-        let tmp = std::env::temp_dir().join(format!(
-            "kyomi-connect-test-save-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kyomi-connect-test-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
 
         let config = test_config();
@@ -167,10 +165,8 @@ mod tests {
 
     #[test]
     fn save_password_to_writes_file_and_sets_permissions() {
-        let tmp = std::env::temp_dir().join(format!(
-            "kyomi-connect-test-pw-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kyomi-connect-test-pw-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
 
         let path = ConfigFile::save_password_to(&tmp, "my_secret_password").unwrap();

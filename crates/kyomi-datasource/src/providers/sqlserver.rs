@@ -188,18 +188,18 @@ impl SqlServerProvider {
 
         // Establish TCP connection
         let addr = config.get_addr();
-        let tcp = tokio::time::timeout(
-            crate::DATASOURCE_TIMEOUT_CONNECT,
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| {
-            Error::Internal(format!(
-                "SQL Server TCP connection to {addr} timed out after {}s",
-                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-            ))
-        })?
-        .map_err(|e| Error::Internal(format!("SQL Server TCP connection to {addr} failed: {e}")))?;
+        let tcp =
+            tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, TcpStream::connect(&addr))
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "SQL Server TCP connection to {addr} timed out after {}s",
+                        crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+                    ))
+                })?
+                .map_err(|e| {
+                    Error::Internal(format!("SQL Server TCP connection to {addr} failed: {e}"))
+                })?;
 
         tcp.set_nodelay(true)
             .map_err(|e| Error::Internal(format!("Failed to set TCP_NODELAY: {e}")))?;
@@ -256,15 +256,8 @@ impl DatasourceProvider for SqlServerProvider {
         include_total: bool,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let mut client = self.client.lock().await;
-        tsql_common::execute_tds_query(
-            &mut client,
-            sql,
-            limit,
-            offset,
-            include_total,
-            "SQL Server",
-        )
-        .await
+        tsql_common::execute_tds_query(&mut client, sql, limit, offset, include_total, "SQL Server")
+            .await
     }
 
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
@@ -346,10 +339,7 @@ impl DatasourceProvider for SqlServerProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -382,10 +372,7 @@ impl DatasourceProvider for SqlServerProvider {
                     .iter()
                     .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
                     .collect();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -467,11 +454,27 @@ mod tests {
             "trust_server_certificate": true,
         });
 
-        let host = config.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
-        let port = config.get("port").and_then(|v| v.as_u64()).map(|p| p as u16).unwrap_or(DEFAULT_PORT);
-        let database = config.get("database").and_then(|v| v.as_str()).unwrap_or(DEFAULT_DATABASE);
-        let encrypt = config.get("encrypt").and_then(|v| v.as_bool()).unwrap_or(true);
-        let trust = config.get("trust_server_certificate").and_then(|v| v.as_bool()).unwrap_or(false);
+        let host = config
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("localhost");
+        let port = config
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16)
+            .unwrap_or(DEFAULT_PORT);
+        let database = config
+            .get("database")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_DATABASE);
+        let encrypt = config
+            .get("encrypt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let trust = config
+            .get("trust_server_certificate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         assert_eq!(host, "db.example.com");
         assert_eq!(port, 1434);
@@ -484,9 +487,19 @@ mod tests {
     fn parse_connection_config_defaults() {
         let config = serde_json::json!({});
 
-        let host = config.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
-        let port = config.get("port").and_then(|v| v.as_u64()).map(|p| p as u16).unwrap_or(DEFAULT_PORT);
-        let database = config.get("database").and_then(|v| v.as_str()).unwrap_or(DEFAULT_DATABASE);
+        let host = config
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("localhost");
+        let port = config
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .map(|p| p as u16)
+            .unwrap_or(DEFAULT_PORT);
+        let database = config
+            .get("database")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_DATABASE);
 
         assert_eq!(host, "localhost");
         assert_eq!(port, 1433);

@@ -259,8 +259,14 @@ mod tests {
     fn header_event_serializes_correctly() {
         let event = QueryStreamEvent::Header {
             columns: vec![
-                ColumnInfo { name: "id".into(), col_type: SimpleType::Number },
-                ColumnInfo { name: "name".into(), col_type: SimpleType::String },
+                ColumnInfo {
+                    name: "id".into(),
+                    col_type: SimpleType::Number,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    col_type: SimpleType::String,
+                },
             ],
             total_rows: Some(42),
         };
@@ -335,15 +341,19 @@ mod tests {
     #[test]
     fn stream_event_roundtrip_header() {
         let event = QueryStreamEvent::Header {
-            columns: vec![
-                ColumnInfo { name: "id".into(), col_type: SimpleType::Number },
-            ],
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                col_type: SimpleType::Number,
+            }],
             total_rows: Some(100),
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let parsed: QueryStreamEvent = serde_json::from_str(&json).expect("deserialize");
         match parsed {
-            QueryStreamEvent::Header { columns, total_rows } => {
+            QueryStreamEvent::Header {
+                columns,
+                total_rows,
+            } => {
                 assert_eq!(columns.len(), 1);
                 assert_eq!(columns[0].name, "id");
                 assert_eq!(total_rows, Some(100));
@@ -381,7 +391,12 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         let parsed: QueryStreamEvent = serde_json::from_str(&json).expect("deserialize");
         match parsed {
-            QueryStreamEvent::Complete { execution_time_ms, bytes_processed, total_chunks, total_rows_returned } => {
+            QueryStreamEvent::Complete {
+                execution_time_ms,
+                bytes_processed,
+                total_chunks,
+                total_rows_returned,
+            } => {
                 assert_eq!(execution_time_ms, Some(999));
                 assert_eq!(bytes_processed, None);
                 assert_eq!(total_chunks, 5);

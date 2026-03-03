@@ -45,11 +45,11 @@ use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Column, PgPool, Row, TypeInfo};
 
-use crate::provider::{
-    ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus,
-};
+use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::providers::aws_sigv4::{self, AwsCredentials};
-use crate::providers::postgres::{char_position_to_line_col, pg_row_value_to_json, pg_type_name_to_oid};
+use crate::providers::postgres::{
+    char_position_to_line_col, pg_row_value_to_json, pg_type_name_to_oid,
+};
 use crate::providers::sqlx_common;
 #[cfg(feature = "ssh")]
 use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
@@ -192,10 +192,12 @@ impl RedshiftProvider {
             PgPool::connect_with(connect_options),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "Redshift connection timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "Redshift connection timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("Redshift connection failed: {e}")))?;
 
         Ok(Self {
@@ -461,7 +463,9 @@ impl DatasourceProvider for RedshiftProvider {
 // ---------------------------------------------------------------------------
 
 /// Resolve standard username/password credentials from the credentials object.
-fn resolve_standard_credentials(credentials: &Value) -> kyomi_connect_protocol::Result<(String, String)> {
+fn resolve_standard_credentials(
+    credentials: &Value,
+) -> kyomi_connect_protocol::Result<(String, String)> {
     let username = credentials
         .get("username")
         .and_then(|v| v.as_str())
@@ -500,25 +504,19 @@ async fn resolve_iam_credentials(
         .get("cluster_identifier")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Provider(
-            "Redshift IAM auth requires cluster_identifier".into(),
-        ))?;
+        .ok_or_else(|| Error::Provider("Redshift IAM auth requires cluster_identifier".into()))?;
 
     let region = credentials
         .get("region")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Provider(
-            "Redshift IAM auth requires region".into(),
-        ))?;
+        .ok_or_else(|| Error::Provider("Redshift IAM auth requires region".into()))?;
 
     let db_user = credentials
         .get("db_user")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Provider(
-            "Redshift IAM auth requires db_user".into(),
-        ))?;
+        .ok_or_else(|| Error::Provider("Redshift IAM auth requires db_user".into()))?;
 
     // AWS credentials: prefer explicit fields, fall back to environment variables
     let access_key_id = credentials
@@ -558,8 +556,7 @@ async fn resolve_iam_credentials(
     );
 
     let temp_creds =
-        get_cluster_credentials(&aws_creds, region, cluster_identifier, db_user, database)
-            .await?;
+        get_cluster_credentials(&aws_creds, region, cluster_identifier, db_user, database).await?;
 
     tracing::info!(
         db_user = temp_creds.db_user,
@@ -656,24 +653,22 @@ async fn get_cluster_credentials(
             .send(),
     )
     .await
-    .map_err(|_| Error::Internal(
-        "Redshift GetClusterCredentials API request timed out".into(),
-    ))?
-    .map_err(|e| Error::Internal(format!(
-        "Redshift GetClusterCredentials API request failed: {e}"
-    )))?;
+    .map_err(|_| Error::Internal("Redshift GetClusterCredentials API request timed out".into()))?
+    .map_err(|e| {
+        Error::Internal(format!(
+            "Redshift GetClusterCredentials API request failed: {e}"
+        ))
+    })?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| Error::Internal(format!(
+    let body = response.text().await.map_err(|e| {
+        Error::Internal(format!(
             "Failed to read Redshift GetClusterCredentials response: {e}"
-        )))?;
+        ))
+    })?;
 
     if !status.is_success() {
-        let error_msg = parse_aws_error_xml(&body)
-            .unwrap_or_else(|| format!("HTTP {status}"));
+        let error_msg = parse_aws_error_xml(&body).unwrap_or_else(|| format!("HTTP {status}"));
         return Err(Error::Internal(format!(
             "Redshift GetClusterCredentials failed: {error_msg}"
         )));
@@ -698,18 +693,15 @@ async fn get_cluster_credentials(
 fn parse_get_cluster_credentials_response(
     xml: &str,
 ) -> kyomi_connect_protocol::Result<TempCredentials> {
-    let db_user = extract_xml_element(xml, "DbUser")
-        .ok_or_else(|| Error::Internal(
-            "Redshift GetClusterCredentials response missing DbUser element".into(),
-        ))?;
+    let db_user = extract_xml_element(xml, "DbUser").ok_or_else(|| {
+        Error::Internal("Redshift GetClusterCredentials response missing DbUser element".into())
+    })?;
 
-    let db_password = extract_xml_element(xml, "DbPassword")
-        .ok_or_else(|| Error::Internal(
-            "Redshift GetClusterCredentials response missing DbPassword element".into(),
-        ))?;
+    let db_password = extract_xml_element(xml, "DbPassword").ok_or_else(|| {
+        Error::Internal("Redshift GetClusterCredentials response missing DbPassword element".into())
+    })?;
 
-    let expiration = extract_xml_element(xml, "Expiration")
-        .unwrap_or_default();
+    let expiration = extract_xml_element(xml, "Expiration").unwrap_or_default();
 
     Ok(TempCredentials {
         db_user,
@@ -764,7 +756,10 @@ fn parse_redshift_ssl_mode(mode: &str) -> PgSslMode {
         "verify-ca" => PgSslMode::VerifyCa,
         "verify-full" => PgSslMode::VerifyFull,
         _ => {
-            tracing::warn!(mode = mode, "Unknown Redshift ssl_mode, defaulting to VerifyCa");
+            tracing::warn!(
+                mode = mode,
+                "Unknown Redshift ssl_mode, defaulting to VerifyCa"
+            );
             PgSslMode::VerifyCa
         }
     }
@@ -806,10 +801,7 @@ static REDSHIFT_POSITION_RE: LazyLock<Regex> =
 /// - `LINE N:` pattern (PostgreSQL-compatible)
 /// - `Position: N` pattern (character offset)
 /// - `at character N` pattern (PostgreSQL standard)
-fn parse_redshift_error_position(
-    error: &sqlx::Error,
-    sql: &str,
-) -> (Option<u32>, Option<u32>) {
+fn parse_redshift_error_position(error: &sqlx::Error, sql: &str) -> (Option<u32>, Option<u32>) {
     let msg = error.to_string();
 
     // Try LINE N: pattern first
@@ -833,7 +825,10 @@ fn parse_redshift_error_position(
     // Also try the PostgreSQL "at character N" pattern
     if let Some(idx) = msg.find("at character ") {
         let start = idx + "at character ".len();
-        let num_str: String = msg[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let num_str: String = msg[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if let Ok(pos) = num_str.parse::<usize>() {
             return char_position_to_line_col(sql, pos);
         }
@@ -854,12 +849,27 @@ mod tests {
 
     #[test]
     fn parse_redshift_ssl_modes() {
-        assert!(matches!(parse_redshift_ssl_mode("disable"), PgSslMode::Disable));
-        assert!(matches!(parse_redshift_ssl_mode("require"), PgSslMode::Require));
-        assert!(matches!(parse_redshift_ssl_mode("verify-ca"), PgSslMode::VerifyCa));
-        assert!(matches!(parse_redshift_ssl_mode("verify-full"), PgSslMode::VerifyFull));
+        assert!(matches!(
+            parse_redshift_ssl_mode("disable"),
+            PgSslMode::Disable
+        ));
+        assert!(matches!(
+            parse_redshift_ssl_mode("require"),
+            PgSslMode::Require
+        ));
+        assert!(matches!(
+            parse_redshift_ssl_mode("verify-ca"),
+            PgSslMode::VerifyCa
+        ));
+        assert!(matches!(
+            parse_redshift_ssl_mode("verify-full"),
+            PgSslMode::VerifyFull
+        ));
         // Default to VerifyCa for Redshift
-        assert!(matches!(parse_redshift_ssl_mode("unknown"), PgSslMode::VerifyCa));
+        assert!(matches!(
+            parse_redshift_ssl_mode("unknown"),
+            PgSslMode::VerifyCa
+        ));
     }
 
     // --- Error position parsing ---
@@ -953,7 +963,10 @@ mod tests {
         let result = parse_get_cluster_credentials_response(xml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("DbPassword"), "Error should mention DbPassword: {err}");
+        assert!(
+            err.contains("DbPassword"),
+            "Error should mention DbPassword: {err}"
+        );
     }
 
     #[test]
@@ -968,12 +981,16 @@ mod tests {
 </ErrorResponse>"#;
 
         let result = parse_aws_error_xml(xml);
-        assert_eq!(result, Some("ClusterNotFound: Cluster mycluster not found.".into()));
+        assert_eq!(
+            result,
+            Some("ClusterNotFound: Cluster mycluster not found.".into())
+        );
     }
 
     #[test]
     fn parse_aws_error_xml_message_only() {
-        let xml = "<ErrorResponse><Error><Message>Something went wrong</Message></Error></ErrorResponse>";
+        let xml =
+            "<ErrorResponse><Error><Message>Something went wrong</Message></Error></ErrorResponse>";
         let result = parse_aws_error_xml(xml);
         assert_eq!(result, Some("Something went wrong".into()));
     }
@@ -1016,7 +1033,10 @@ mod tests {
         let result = resolve_standard_credentials(&creds);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("username"), "Error should mention username: {err}");
+        assert!(
+            err.contains("username"),
+            "Error should mention username: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1093,8 +1113,23 @@ mod tests {
         let creds_standard = serde_json::json!({ "username": "admin" });
         let creds_empty = serde_json::json!({});
 
-        assert!(creds_iam.get("iam").and_then(|v| v.as_bool()).unwrap_or(false));
-        assert!(!creds_standard.get("iam").and_then(|v| v.as_bool()).unwrap_or(false));
-        assert!(!creds_empty.get("iam").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(
+            creds_iam
+                .get("iam")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
+        assert!(
+            !creds_standard
+                .get("iam")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
+        assert!(
+            !creds_empty
+                .get("iam")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
     }
 }

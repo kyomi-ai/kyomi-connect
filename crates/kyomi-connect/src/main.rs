@@ -8,13 +8,16 @@ pub mod wizard;
 mod ws_client;
 
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "kyomi-connect", about = "Kyomi Connect — secure database proxy agent")]
+#[command(
+    name = "kyomi-connect",
+    about = "Kyomi Connect — secure database proxy agent"
+)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -146,10 +149,14 @@ async fn main() {
 
             // Database check
             eprint!("  Database     ");
-            let db_label = peek.as_ref()
+            let db_label = peek
+                .as_ref()
                 .map(|p| db_type_label(&p.db))
                 .unwrap_or("unknown");
-            eprintln!("{db_label} \x1b[2m({}:{}/{})\x1b[0m", cf.db_host, cf.db_port, cf.db_name);
+            eprintln!(
+                "{db_label} \x1b[2m({}:{}/{})\x1b[0m",
+                cf.db_host, cf.db_port, cf.db_name
+            );
 
             // Kyomi API check
             if let Some(peek) = peek {
@@ -188,17 +195,15 @@ async fn main() {
 
         // No subcommand: auto-detect — has config → run, no config → setup then run
         None => {
-            let has_config = config_file::ConfigFile::load().is_some()
-                || std::env::var("KYOMI_TOKEN").is_ok();
+            let has_config =
+                config_file::ConfigFile::load().is_some() || std::env::var("KYOMI_TOKEN").is_ok();
 
             if has_config {
                 run_agent().await;
             } else if std::io::stdin().is_terminal() {
                 // No config, interactive terminal → run setup first
-                if let Err(e) = wizard::run_setup(
-                    None, None, None, None, None, None, None, None,
-                )
-                .await
+                if let Err(e) =
+                    wizard::run_setup(None, None, None, None, None, None, None, None).await
                 {
                     eprintln!("  Setup failed: {e}");
                     std::process::exit(1);
@@ -244,16 +249,15 @@ async fn run_agent() {
         Ok(e) => {
             eprintln!(
                 "\x1b[32m\u{2713}\x1b[0m  {} \x1b[2m({}:{})\x1b[0m",
-                db_type_label(&config.db_type), config.db_host, config.db_port,
+                db_type_label(&config.db_type),
+                config.db_host,
+                config.db_port,
             );
             Arc::new(e)
         }
         Err(e) => {
             let msg = e.to_string();
-            let display_msg = msg
-                .rsplit_once(": ")
-                .map(|(_, root)| root)
-                .unwrap_or(&msg);
+            let display_msg = msg.rsplit_once(": ").map(|(_, root)| root).unwrap_or(&msg);
             eprintln!("\x1b[31m\u{2717}\x1b[0m  {display_msg}");
             eprintln!();
             eprintln!("  Run 'kyomi-connect setup' to reconfigure.");
@@ -280,10 +284,7 @@ async fn run_agent() {
         }
         Err(e) => {
             let msg = e.to_string();
-            let display_msg = msg
-                .rsplit_once(": ")
-                .map(|(_, root)| root)
-                .unwrap_or(&msg);
+            let display_msg = msg.rsplit_once(": ").map(|(_, root)| root).unwrap_or(&msg);
             eprintln!("\x1b[31m\u{2717}\x1b[0m  {display_msg}");
             eprintln!();
             eprintln!("  Will keep retrying in the background...");

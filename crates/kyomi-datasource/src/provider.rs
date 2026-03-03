@@ -225,7 +225,9 @@ pub trait DatasourceProvider: Send + Sync {
     /// The default implementation returns a success result indicating that
     /// dry-run validation is not available for the provider.
     async fn dry_run(&self, _sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
-        Ok(DryRunResult::success("Dry run not available for this provider"))
+        Ok(DryRunResult::success(
+            "Dry run not available for this provider",
+        ))
     }
 
     /// List accessible projects (e.g., GCP projects for BigQuery).
@@ -309,7 +311,9 @@ pub trait DatasourceProvider: Send + Sync {
         include_total: bool,
         _chunk_size: Option<u32>,
     ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::QueryStream> {
-        let result = self.execute_query(sql, limit, offset, include_total).await?;
+        let result = self
+            .execute_query(sql, limit, offset, include_total)
+            .await?;
         crate::stream::query_result_to_stream(result)
     }
 

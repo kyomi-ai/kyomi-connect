@@ -42,6 +42,7 @@ pub struct AwsCredentials {
 /// # Returns
 ///
 /// A tuple of `(authorization_header_value, signed_headers_string)`.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_request(
     method: &str,
     host: &str,
@@ -69,17 +70,12 @@ pub fn sign_request(
     let credential_scope = format!("{datestamp}/{region}/{service}/aws4_request");
     let canonical_request_hash = hex_sha256(canonical_request.as_bytes());
 
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{datetime}\n{credential_scope}\n{canonical_request_hash}"
-    );
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{datetime}\n{credential_scope}\n{canonical_request_hash}");
 
     // Step 3: Calculate signing key
-    let signing_key = derive_signing_key(
-        &credentials.secret_access_key,
-        datestamp,
-        region,
-        service,
-    );
+    let signing_key =
+        derive_signing_key(&credentials.secret_access_key, datestamp, region, service);
 
     // Step 4: Calculate signature
     let signature = hex_hmac_sha256(&signing_key, string_to_sign.as_bytes());
@@ -101,8 +97,7 @@ fn hex_sha256(data: &[u8]) -> String {
 
 /// Compute HMAC-SHA256 and return the raw bytes.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -208,7 +203,12 @@ mod tests {
 
     #[test]
     fn derive_signing_key_produces_expected_length() {
-        let key = derive_signing_key("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20120215", "us-east-1", "iam");
+        let key = derive_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20120215",
+            "us-east-1",
+            "iam",
+        );
         // Signing key should be 32 bytes (SHA-256 output)
         assert_eq!(key.len(), 32);
     }
@@ -225,10 +225,9 @@ mod tests {
             "iam",
         );
         let expected = [
-            0xf4, 0x78, 0x0e, 0x2d, 0x9f, 0x65, 0xfa, 0x89,
-            0x5f, 0x9c, 0x67, 0xb3, 0x2c, 0xe1, 0xba, 0xf0,
-            0xb0, 0xd8, 0xa4, 0x35, 0x05, 0xa0, 0x00, 0xa1,
-            0xa9, 0xe0, 0x90, 0xd4, 0x14, 0xdb, 0x40, 0x4d,
+            0xf4, 0x78, 0x0e, 0x2d, 0x9f, 0x65, 0xfa, 0x89, 0x5f, 0x9c, 0x67, 0xb3, 0x2c, 0xe1,
+            0xba, 0xf0, 0xb0, 0xd8, 0xa4, 0x35, 0x05, 0xa0, 0x00, 0xa1, 0xa9, 0xe0, 0x90, 0xd4,
+            0x14, 0xdb, 0x40, 0x4d,
         ];
         assert_eq!(key, expected);
     }
@@ -260,7 +259,10 @@ mod tests {
 
     #[test]
     fn build_canonical_query_string_encodes_values() {
-        let params = [("Action", "GetClusterCredentials"), ("DbUser", "admin user")];
+        let params = [
+            ("Action", "GetClusterCredentials"),
+            ("DbUser", "admin user"),
+        ];
         let result = build_canonical_query_string(&params);
         assert_eq!(result, "Action=GetClusterCredentials&DbUser=admin%20user");
     }
@@ -294,8 +296,15 @@ mod tests {
         // Signature should be 64 hex characters
         let sig_start = auth.rfind("Signature=").unwrap() + "Signature=".len();
         let signature = &auth[sig_start..];
-        assert_eq!(signature.len(), 64, "Signature should be 64 hex chars, got: {signature}");
-        assert!(signature.chars().all(|c| c.is_ascii_hexdigit()), "Signature should be hex: {signature}");
+        assert_eq!(
+            signature.len(),
+            64,
+            "Signature should be 64 hex chars, got: {signature}"
+        );
+        assert!(
+            signature.chars().all(|c| c.is_ascii_hexdigit()),
+            "Signature should be hex: {signature}"
+        );
     }
 
     #[test]
@@ -317,12 +326,12 @@ mod tests {
         );
 
         let auth1 = sign_request(
-            params.0, params.1, params.2, params.3, params.4, params.5,
-            &params.6, params.7, params.8,
+            params.0, params.1, params.2, params.3, params.4, params.5, &params.6, params.7,
+            params.8,
         );
         let auth2 = sign_request(
-            params.0, params.1, params.2, params.3, params.4, params.5,
-            &params.6, params.7, params.8,
+            params.0, params.1, params.2, params.3, params.4, params.5, &params.6, params.7,
+            params.8,
         );
         assert_eq!(auth1, auth2);
     }

@@ -160,14 +160,12 @@ impl MySqlProvider {
             .ssl_mode(ssl_mode);
 
         // For verify-ca / verify-full, attach the CA certificate if provided
-        if matches!(ssl_mode, MySqlSslMode::VerifyCa | MySqlSslMode::VerifyIdentity) {
-            if let Some(ssl_ca_pem) = connection_config
-                .get("ssl_ca")
-                .and_then(|v| v.as_str())
-            {
-                connect_options =
-                    connect_options.ssl_ca_from_pem(ssl_ca_pem.as_bytes().to_vec());
-            }
+        if matches!(
+            ssl_mode,
+            MySqlSslMode::VerifyCa | MySqlSslMode::VerifyIdentity
+        ) && let Some(ssl_ca_pem) = connection_config.get("ssl_ca").and_then(|v| v.as_str())
+        {
+            connect_options = connect_options.ssl_ca_from_pem(ssl_ca_pem.as_bytes().to_vec());
         }
 
         let pool = tokio::time::timeout(
@@ -175,10 +173,12 @@ impl MySqlProvider {
             MySqlPool::connect_with(connect_options),
         )
         .await
-        .map_err(|_| Error::Internal(format!(
-            "MySQL connection timed out after {}s",
-            crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-        )))?
+        .map_err(|_| {
+            Error::Internal(format!(
+                "MySQL connection timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("MySQL connection failed: {e}")))?;
 
         Ok(Self {
@@ -230,7 +230,7 @@ impl DatasourceProvider for MySqlProvider {
         // Execute with timeout
         let query_result = tokio::time::timeout(
             crate::DATASOURCE_TIMEOUT_QUERY,
-            sqlx::query(&paginated_sql).fetch_all(&self.pool),
+            sqlx::query(paginated_sql).fetch_all(&self.pool),
         )
         .await;
 
@@ -456,7 +456,10 @@ fn parse_mysql_ssl_mode(mode: &str) -> MySqlSslMode {
         "verify-ca" => MySqlSslMode::VerifyCa,
         "verify-full" => MySqlSslMode::VerifyIdentity,
         _ => {
-            tracing::warn!(mode = mode, "Unknown MySQL ssl_mode, defaulting to Required");
+            tracing::warn!(
+                mode = mode,
+                "Unknown MySQL ssl_mode, defaulting to Required"
+            );
             MySqlSslMode::Required
         }
     }
@@ -601,16 +604,34 @@ mod tests {
 
     #[test]
     fn parse_ssl_mode_all_variants() {
-        assert!(matches!(parse_mysql_ssl_mode("disable"), MySqlSslMode::Disabled));
-        assert!(matches!(parse_mysql_ssl_mode("preferred"), MySqlSslMode::Preferred));
-        assert!(matches!(parse_mysql_ssl_mode("require"), MySqlSslMode::Required));
-        assert!(matches!(parse_mysql_ssl_mode("verify-ca"), MySqlSslMode::VerifyCa));
-        assert!(matches!(parse_mysql_ssl_mode("verify-full"), MySqlSslMode::VerifyIdentity));
+        assert!(matches!(
+            parse_mysql_ssl_mode("disable"),
+            MySqlSslMode::Disabled
+        ));
+        assert!(matches!(
+            parse_mysql_ssl_mode("preferred"),
+            MySqlSslMode::Preferred
+        ));
+        assert!(matches!(
+            parse_mysql_ssl_mode("require"),
+            MySqlSslMode::Required
+        ));
+        assert!(matches!(
+            parse_mysql_ssl_mode("verify-ca"),
+            MySqlSslMode::VerifyCa
+        ));
+        assert!(matches!(
+            parse_mysql_ssl_mode("verify-full"),
+            MySqlSslMode::VerifyIdentity
+        ));
     }
 
     #[test]
     fn parse_ssl_mode_unknown_defaults_to_required() {
-        assert!(matches!(parse_mysql_ssl_mode("unknown"), MySqlSslMode::Required));
+        assert!(matches!(
+            parse_mysql_ssl_mode("unknown"),
+            MySqlSslMode::Required
+        ));
         assert!(matches!(parse_mysql_ssl_mode(""), MySqlSslMode::Required));
     }
 

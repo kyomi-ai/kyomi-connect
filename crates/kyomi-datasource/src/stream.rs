@@ -58,11 +58,7 @@ pub fn query_result_to_stream(result: QueryResult) -> kyomi_connect_protocol::Re
         total_rows_returned,
     };
 
-    let stream = futures_util::stream::iter(vec![
-        Ok(header),
-        Ok(chunk),
-        Ok(complete),
-    ]);
+    let stream = futures_util::stream::iter(vec![Ok(header), Ok(chunk), Ok(complete)]);
 
     Ok(Box::pin(stream))
 }
@@ -78,7 +74,9 @@ pub fn query_result_to_stream(result: QueryResult) -> kyomi_connect_protocol::Re
 /// to handle out-of-order delivery.
 ///
 /// Returns an error if the stream is malformed (missing Header or Complete).
-pub async fn collect_stream_to_result(mut stream: QueryStream) -> kyomi_connect_protocol::Result<QueryResult> {
+pub async fn collect_stream_to_result(
+    mut stream: QueryStream,
+) -> kyomi_connect_protocol::Result<QueryResult> {
     let mut columns: Option<Vec<ColumnInfo>> = None;
     let mut total_rows: Option<i64> = None;
     let mut chunks: Vec<(u32, Vec<Vec<serde_json::Value>>)> = Vec::new();
@@ -179,7 +177,10 @@ mod tests {
 
         // Header
         match &events[0] {
-            QueryStreamEvent::Header { columns, total_rows } => {
+            QueryStreamEvent::Header {
+                columns,
+                total_rows,
+            } => {
                 assert_eq!(columns.len(), 2);
                 assert_eq!(columns[0].name, "id");
                 assert_eq!(columns[1].name, "name");
@@ -237,7 +238,10 @@ mod tests {
         assert_eq!(events.len(), 3);
 
         match &events[0] {
-            QueryStreamEvent::Header { columns, total_rows } => {
+            QueryStreamEvent::Header {
+                columns,
+                total_rows,
+            } => {
                 assert!(columns.is_empty());
                 assert_eq!(*total_rows, None);
             }
@@ -253,7 +257,8 @@ mod tests {
 
         match &events[2] {
             QueryStreamEvent::Complete {
-                total_rows_returned, ..
+                total_rows_returned,
+                ..
             } => {
                 assert_eq!(*total_rows_returned, 0);
             }

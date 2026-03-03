@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,11 +41,7 @@ impl WsClient {
 
     /// Main loop: connect, process messages, reconnect on drop.
     /// Never returns — runs until the process exits.
-    pub async fn run_forever<F, Fut>(
-        &self,
-        ws_connected: Arc<AtomicBool>,
-        handler: F,
-    ) -> !
+    pub async fn run_forever<F, Fut>(&self, ws_connected: Arc<AtomicBool>, handler: F) -> !
     where
         F: Fn(ConnectRequest) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<ConnectResponse>> + Send + 'static,
@@ -107,10 +103,7 @@ impl WsClient {
             )
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
-            .header(
-                "Host",
-                extract_host(&self.url).unwrap_or("api.kyomi.ai"),
-            )
+            .header("Host", extract_host(&self.url).unwrap_or("api.kyomi.ai"))
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build request: {e}"))?;
 
