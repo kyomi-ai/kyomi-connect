@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "crates/kyomi-connect",
+    "crates/kyomi-connect-protocol",
+    "crates/kyomi-datasource",
+]
+resolver = "3"
+
+# Shared dependency versions — all crates use these
+[workspace.dependencies]
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "normalize-path", "set-header", "trace"] }
+
+# Database drivers (optional, feature-gated)
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "uuid", "chrono", "json", "macros", "rust_decimal"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Auth / Crypto
+jsonwebtoken = "9"
+base64 = "0.22"
+rsa = { version = "0.9", features = ["pkcs5"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
+
+# SSH tunneling
+russh = "0.57"
+
+# Type support
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Hashing (AWS Signature V4 for Redshift IAM)
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+# Error parsing
+regex = "1"
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+async-trait = "0.1"
+futures-util = "0.3"
+rand = "0.9"
+http = "1"
+
+# Internal crates
+kyomi-connect-protocol = { path = "crates/kyomi-connect-protocol" }
+kyomi-datasource = { path = "crates/kyomi-datasource" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
