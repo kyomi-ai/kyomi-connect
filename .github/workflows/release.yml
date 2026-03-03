@@ -98,23 +98,25 @@ jobs:
 
   build-macos-amd64:
     needs: [prepare]
-    runs-on: macos-13
+    runs-on: macos-14
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust stable
+      - name: Install Rust stable with x86_64 target
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build binary
-        run: cargo build --release -p kyomi-connect
+      - name: Build binary (cross-compile for Intel)
+        run: cargo build --release -p kyomi-connect --target x86_64-apple-darwin
 
       - name: Rename binary
-        run: mv target/release/${{ env.BINARY_NAME }} kyomi-connect-macos-amd64
+        run: mv target/x86_64-apple-darwin/release/${{ env.BINARY_NAME }} kyomi-connect-macos-amd64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -135,6 +137,14 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Get crates.io publish token via OIDC
+        run: |
+          OIDC_TOKEN=$(curl -sLS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=crates.io" \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')
+          CRATES_TOKEN=$(curl -sLS 'https://crates.io/api/v1/trusted_publishing/tokens' \
+            -H "Authorization: bearer ${OIDC_TOKEN}" | jq -r '.token')
+          echo "CARGO_REGISTRY_TOKEN=${CRATES_TOKEN}" >> $GITHUB_ENV
 
       - name: Publish kyomi-connect-protocol
         run: cargo publish -p kyomi-connect-protocol
