@@ -1,11 +1,11 @@
 [package]
 name = "kyomi-connect-protocol"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 description = "Wire protocol and shared types for Kyomi Connect"
 license = "Apache-2.0"
 repository = "https://github.com/kyomi-ai/kyomi-connect"
-homepage = "https://kyomi.ai/connect"
+homepage = "https://github.com/kyomi-ai/kyomi-connect"
 
 [dependencies]
 serde = { workspace = true }
