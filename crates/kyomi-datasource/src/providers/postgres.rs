@@ -159,13 +159,19 @@ impl PostgresProvider {
             "Connecting to PostgreSQL"
         );
 
-        let connect_options = PgConnectOptions::new()
+        let mut connect_options = PgConnectOptions::new()
             .host(&host)
             .port(port)
             .database(database)
             .username(username)
             .password(password)
             .ssl_mode(ssl_mode);
+
+        // If a CA certificate path is specified, tell sqlx to use it for
+        // server certificate verification (verify-ca / verify-full modes).
+        if let Some(ssl_ca) = connection_config.get("ssl_ca").and_then(|v| v.as_str()) {
+            connect_options = connect_options.ssl_root_cert(ssl_ca);
+        }
 
         let pool = tokio::time::timeout(
             crate::DATASOURCE_TIMEOUT_CONNECT,
