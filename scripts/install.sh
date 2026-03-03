@@ -25,8 +25,8 @@ case "$OS" in
 esac
 
 case "$ARCH" in
-    x86_64|amd64) ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
     *)             echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
@@ -38,16 +38,35 @@ else
 fi
 
 ASSET_NAME="${BINARY_NAME}-${OS}-${ARCH}"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}.tar.gz"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
+CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
 echo "Installing Kyomi Connect v${VERSION} (${OS}/${ARCH})..."
 
-# Download and extract
+# Download binary and checksum
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL "$DOWNLOAD_URL" -o "${TMPDIR}/${ASSET_NAME}.tar.gz"
-tar -xzf "${TMPDIR}/${ASSET_NAME}.tar.gz" -C "$TMPDIR"
+curl -fsSL "$DOWNLOAD_URL" -o "${TMPDIR}/${BINARY_NAME}"
+curl -fsSL "$CHECKSUM_URL" -o "${TMPDIR}/${ASSET_NAME}.sha256"
+
+# Verify checksum
+EXPECTED_HASH="$(awk '{print $1}' "${TMPDIR}/${ASSET_NAME}.sha256")"
+if command -v sha256sum &>/dev/null; then
+    ACTUAL_HASH="$(sha256sum "${TMPDIR}/${BINARY_NAME}" | awk '{print $1}')"
+elif command -v shasum &>/dev/null; then
+    ACTUAL_HASH="$(shasum -a 256 "${TMPDIR}/${BINARY_NAME}" | awk '{print $1}')"
+else
+    echo "Warning: could not verify checksum (no sha256sum or shasum found)" >&2
+    ACTUAL_HASH="$EXPECTED_HASH"
+fi
+
+if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+    echo "Checksum verification failed!" >&2
+    echo "  Expected: $EXPECTED_HASH" >&2
+    echo "  Actual:   $ACTUAL_HASH" >&2
+    exit 1
+fi
 
 # Install binary
 if [ -w "$INSTALL_DIR" ]; then
