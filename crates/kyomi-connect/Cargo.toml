@@ -1,11 +1,11 @@
 [package]
 name = "kyomi-connect"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "On-premise database agent for Kyomi — connects your data warehouse securely"
 license = "Apache-2.0"
 repository = "https://github.com/kyomi-ai/kyomi-connect"
-homepage = "https://github.com/kyomi-ai/kyomi-connect"
+homepage = "https://kyomi.ai"
 
 [[bin]]
 name = "kyomi-connect"
