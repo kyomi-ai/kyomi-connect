@@ -1,6 +1,6 @@
 [package]
 name = "kyomi-datasource"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 description = "Database provider implementations for Kyomi Connect"
 license = "Apache-2.0"
