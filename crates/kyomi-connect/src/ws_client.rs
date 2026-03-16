@@ -116,7 +116,9 @@ impl WsClient {
 
     /// Run a single WebSocket session with concurrent reader/writer tasks.
     ///
-    /// Returns when the connection is lost or the server sends a close frame.
+    /// Returns when the connection is lost, the server sends a close frame,
+    /// or no message is received within `SILENCE_TIMEOUT` (server sends pings
+    /// every 30s, so 60s of silence means the connection is dead).
     async fn run_session<F, Fut>(
         &self,
         ws_sender: futures_util::stream::SplitSink<
@@ -135,14 +137,38 @@ impl WsClient {
         F: Fn(ConnectRequest) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<ConnectResponse>> + Send + 'static,
     {
+        /// If no message (ping, command, anything) arrives within this duration,
+        /// assume the connection is dead. The server sends pings every 30s, so
+        /// 60s means two consecutive pings were missed.
+        const SILENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
         // Channel for sending messages to the writer task
         let (write_tx, write_rx) = mpsc::channel::<tungstenite::Message>(64);
 
         // Spawn the writer task (owns ws_sender)
         let writer_handle = tokio::spawn(writer_task(ws_sender, write_rx));
 
-        // Reader loop: deserialize requests and spawn handler tasks
-        while let Some(msg) = ws_receiver.next().await {
+        // Reader loop: deserialize requests and spawn handler tasks.
+        // Each recv is wrapped in a timeout — if the server goes silent
+        // (dead TCP, pod replaced, network partition), we detect it and
+        // return so run_forever can reconnect.
+        loop {
+            let msg = match tokio::time::timeout(SILENCE_TIMEOUT, ws_receiver.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    // Stream ended (server closed cleanly)
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — no message in 60s, server is gone
+                    tracing::warn!(
+                        timeout_secs = SILENCE_TIMEOUT.as_secs(),
+                        "No message from server in {SILENCE_TIMEOUT:?}, assuming connection dead"
+                    );
+                    break;
+                }
+            };
+
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
                     let request: ConnectRequest = match serde_json::from_str(&text) {
