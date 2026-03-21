@@ -1138,6 +1138,28 @@ fn parse_snowflake_error_line(error_msg: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Snowflake JSON row directly to Arrow column builders.
+///
+/// Snowflake returns rows as JSON arrays in the `"data"` field of the response.
+/// Each element in the array corresponds to a column value. Uses [`SimpleType`]
+/// from `columns` to guide type-aware conversion via the shared
+/// [`crate::arrow_builder::json_value_to_arrow`].
+pub(crate) fn snowflake_row_to_arrow(
+    row: &[Value],
+    columns: &[crate::provider::ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

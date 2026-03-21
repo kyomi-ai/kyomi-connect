@@ -48,7 +48,7 @@ use sqlx::{Column, PgPool, Row, TypeInfo};
 use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::providers::aws_sigv4::{self, AwsCredentials};
 use crate::providers::postgres::{
-    char_position_to_line_col, pg_row_value_to_json, pg_type_name_to_oid,
+    char_position_to_line_col, pg_row_to_arrow, pg_row_value_to_json, pg_type_name_to_oid,
 };
 use crate::providers::sqlx_common;
 #[cfg(feature = "ssh")]
@@ -462,6 +462,22 @@ impl DatasourceProvider for RedshiftProvider {
         self.pool.close().await;
         tracing::debug!("Redshift connection pool closed");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Redshift row directly to Arrow column builders.
+///
+/// Redshift is wire-compatible with PostgreSQL, so this delegates directly to
+/// [`pg_row_to_arrow`].
+pub(crate) fn redshift_row_to_arrow(
+    row: &sqlx::postgres::PgRow,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    pg_row_to_arrow(row, columns, builder);
 }
 
 // ---------------------------------------------------------------------------

@@ -930,6 +930,50 @@ fn coerce_value_type(value: &Value, col: Option<&ColumnInfo>, server_tz_is_utc: 
     }
 }
 
+/// Convert a ClickHouse JSON row directly to Arrow column builders.
+///
+/// ClickHouse data arrives as JSON arrays from the HTTP API (JSONCompact format).
+/// Each element in `row` corresponds to a column. Uses [`SimpleType`] from
+/// `columns` to guide type-aware conversion via the shared
+/// [`crate::arrow_builder::json_value_to_arrow`], with ClickHouse-specific
+/// handling for server timezone annotation on timestamps.
+pub(crate) fn clickhouse_row_to_arrow(
+    row: &[Value],
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+    server_tz_is_utc: bool,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+
+        // ClickHouse-specific: for Timestamp columns, if the server timezone
+        // is UTC, treat bare datetime strings as TimestampTz (append Z).
+        if server_tz_is_utc && col.col_type == SimpleType::Timestamp {
+            if let Some(s) = value.as_str() {
+                // Convert "YYYY-MM-DD HH:MM:SS" → ISO 8601 with Z suffix
+                if s.len() >= 19 && s.as_bytes().get(10) == Some(&b' ') {
+                    let mut iso = String::with_capacity(s.len() + 1);
+                    iso.push_str(&s[..10]);
+                    iso.push('T');
+                    iso.push_str(&s[11..]);
+                    iso.push('Z');
+                    let coerced = Value::String(iso);
+                    crate::arrow_builder::json_value_to_arrow(
+                        &coerced,
+                        SimpleType::TimestampTz,
+                        builder,
+                        idx,
+                    );
+                    continue;
+                }
+            }
+        }
+
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
+}
+
 /// Sanitize null bytes from a JSON value.
 ///
 /// ClickHouse can return null bytes (`\x00`) in string fields (e.g., country

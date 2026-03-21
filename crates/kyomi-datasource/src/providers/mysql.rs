@@ -522,7 +522,10 @@ fn mysql_row_value_to_json(row: &sqlx::mysql::MySqlRow, idx: usize, col_type: Si
                 serde_json::json!(v)
             } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                 // DECIMAL/NUMERIC — lossless decode, convert to f64 for JSON
-                serde_json::json!(v.to_string().parse::<f64>().unwrap_or(0.0))
+                match v.to_string().parse::<f64>() {
+                    Ok(f) => serde_json::json!(f),
+                    Err(_) => Value::Null,
+                }
             } else {
                 Value::Null
             }
@@ -577,6 +580,95 @@ fn mysql_row_value_to_json(row: &sqlx::mysql::MySqlRow, idx: usize, col_type: Si
             .or_else(|| mysql_try_get_bytes_as_string(row, idx).map(Value::String))
             .unwrap_or(Value::Null),
     }
+}
+
+/// Convert a MySQL row directly to Arrow column builders.
+///
+/// This is the Arrow counterpart of [`mysql_row_value_to_json`]. Instead of
+/// creating `serde_json::Value` intermediaries, native Rust types go directly
+/// into Arrow column builders, preserving date/time/timestamp precision.
+pub(crate) fn mysql_row_to_arrow(
+    row: &sqlx::mysql::MySqlRow,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        match col.col_type {
+            SimpleType::Boolean => match row.try_get::<Option<bool>, _>(idx) {
+                Ok(Some(v)) => builder.append_bool(idx, v),
+                _ => builder.append_null(idx),
+            },
+            SimpleType::Number => {
+                // Try i64 → u64 (unsigned) → f64 → Decimal
+                if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(idx) {
+                    builder.append_i64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<Option<u64>, _>(idx) {
+                    // MySQL UNSIGNED integer types (BIGINT UNSIGNED, etc.)
+                    builder.append_f64(idx, v as f64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
+                    builder.append_f64(idx, v);
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<rust_decimal::Decimal>, _>(idx)
+                {
+                    if let Ok(f) = v.to_string().parse::<f64>() {
+                        builder.append_f64(idx, f);
+                    } else {
+                        builder.append_null(idx);
+                    }
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::String => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else if let Some(s) = mysql_try_get_bytes_as_string(row, idx) {
+                    builder.append_string(idx, &s);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Date => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDate>, _>(idx) {
+                    builder.append_naive_date(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Time => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveTime>, _>(idx) {
+                    builder.append_naive_time(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Timestamp => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
+                    builder.append_naive_datetime(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::TimestampTz => {
+                // MySQL TIMESTAMP is stored as UTC; sqlx decodes as NaiveDateTime
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
+                    builder.append_datetime_utc(idx, v.and_utc());
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Unknown => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else if let Some(s) = mysql_try_get_bytes_as_string(row, idx) {
+                    builder.append_string(idx, &s);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+        }
+    }
+    builder.finish_row();
 }
 
 /// Regex for MySQL "at line N" error pattern, compiled once.

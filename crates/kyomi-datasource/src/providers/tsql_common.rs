@@ -296,6 +296,107 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a tiberius row directly to Arrow column builders.
+///
+/// This is the Arrow counterpart of [`tds_row_value_to_json`]. Instead of
+/// creating `serde_json::Value` intermediaries, native Rust types go directly
+/// into Arrow column builders, preserving date/time/timestamp precision.
+///
+/// Used by both the SQL Server and Synapse providers.
+pub(crate) fn tds_row_to_arrow(
+    row: &Row,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        match col.col_type {
+            SimpleType::Boolean => match row.try_get::<bool, _>(idx) {
+                Ok(Some(v)) => builder.append_bool(idx, v),
+                _ => builder.append_null(idx),
+            },
+            SimpleType::Number => {
+                // Try i64 → f64 → i32 → i16 → u8 → f32 → Numeric
+                if let Ok(Some(v)) = row.try_get::<i64, _>(idx) {
+                    builder.append_i64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<f64, _>(idx) {
+                    builder.append_f64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<i16, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<u8, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<f32, _>(idx) {
+                    builder.append_f64(idx, v as f64);
+                } else if let Ok(Some(v)) = row.try_get::<tiberius::numeric::Numeric, _>(idx) {
+                    let s = format!("{v}");
+                    if let Ok(f) = s.parse::<f64>() {
+                        builder.append_f64(idx, f);
+                    } else {
+                        builder.append_null(idx);
+                    }
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::String => {
+                if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
+                    builder.append_string(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<tiberius::Uuid, _>(idx) {
+                    builder.append_string(idx, &v.to_string());
+                } else if let Ok(Some(v)) = row.try_get::<&[u8], _>(idx) {
+                    builder.append_string(idx, &hex_encode(v));
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Date => {
+                if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(idx) {
+                    builder.append_naive_date(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Time => {
+                if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(idx) {
+                    builder.append_naive_time(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Timestamp => {
+                if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
+                    builder.append_naive_datetime(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::TimestampTz => {
+                if let Ok(Some(v)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(idx) {
+                    builder.append_datetime_utc(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
+                    // Don't silently assert UTC — store as string like the JSON path
+                    builder.append_string(idx, &v.format("%Y-%m-%dT%H:%M:%S").to_string());
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Unknown => {
+                if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
+                    builder.append_string(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+        }
+    }
+    builder.finish_row();
+}
+
+// ---------------------------------------------------------------------------
 // Shared query execution helpers
 // ---------------------------------------------------------------------------
 

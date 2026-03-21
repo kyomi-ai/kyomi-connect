@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+pub mod arrow_builder;
 pub mod factory;
 pub mod oauth_refresh;
 pub mod provider;

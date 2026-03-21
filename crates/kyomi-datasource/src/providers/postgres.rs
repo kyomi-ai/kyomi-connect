@@ -646,7 +646,10 @@ pub(crate) fn pg_row_value_to_json(
                 serde_json::json!(v)
             } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                 // NUMERIC/DECIMAL — lossless decode, convert to f64 for JSON
-                serde_json::json!(v.to_string().parse::<f64>().unwrap_or(0.0))
+                match v.to_string().parse::<f64>() {
+                    Ok(f) => serde_json::json!(f),
+                    Err(_) => Value::Null,
+                }
             } else if let Ok(Some(v)) =
                 row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
             {
@@ -714,6 +717,109 @@ pub(crate) fn pg_row_value_to_json(
                 .unwrap_or(Value::Null)
         }
     }
+}
+
+/// Append a PostgreSQL row's values directly to an [`ArrowResultBuilder`].
+///
+/// This is the Arrow counterpart of [`pg_row_value_to_json`]. Instead of
+/// creating `serde_json::Value` intermediaries, native Rust types go directly
+/// into Arrow column builders, preserving date/time/timestamp precision.
+///
+/// Also used by the Redshift provider (which shares the PostgreSQL wire protocol).
+pub(crate) fn pg_row_to_arrow(
+    row: &sqlx::postgres::PgRow,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    use crate::provider::SimpleType;
+
+    for (idx, col) in columns.iter().enumerate() {
+        match col.col_type {
+            SimpleType::Boolean => match row.try_get::<Option<bool>, _>(idx) {
+                Ok(Some(v)) => builder.append_bool(idx, v),
+                _ => builder.append_null(idx),
+            },
+            SimpleType::Number => {
+                // Try i32 → i64 → i16 → f32 → f64 → Decimal → PgMoney
+                if let Ok(Some(v)) = row.try_get::<Option<i32>, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(idx) {
+                    builder.append_i64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<Option<i16>, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<f32>, _>(idx) {
+                    builder.append_f64(idx, v as f64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
+                    builder.append_f64(idx, v);
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<rust_decimal::Decimal>, _>(idx)
+                {
+                    if let Ok(f) = v.to_string().parse::<f64>() {
+                        builder.append_f64(idx, f);
+                    } else {
+                        builder.append_null(idx);
+                    }
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
+                {
+                    builder.append_f64(idx, v.0 as f64 / 100.0);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::String => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(idx)
+                {
+                    builder.append_string(idx, &format_pg_interval(&v));
+                } else if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+                    builder.append_string(idx, &format!("\\x{}", hex::encode(&v)));
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Date => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDate>, _>(idx) {
+                    builder.append_naive_date(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Time => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveTime>, _>(idx) {
+                    builder.append_naive_time(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Timestamp => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
+                    builder.append_naive_datetime(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::TimestampTz => {
+                if let Ok(Some(v)) =
+                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
+                {
+                    builder.append_datetime_utc(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Unknown => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+        }
+    }
+    builder.finish_row();
 }
 
 /// Parse PostgreSQL error for line/column position.

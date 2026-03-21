@@ -51,6 +51,9 @@ regex = "1"
 # URL encoding
 percent-encoding = "2"
 
+# Arrow (columnar data format)
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+
 # Utilities
 anyhow = "1"
 thiserror = "2"

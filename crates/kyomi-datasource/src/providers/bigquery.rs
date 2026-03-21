@@ -1148,6 +1148,33 @@ fn extract_bigquery_rows(page: &Value) -> Vec<Vec<Value>> {
         .unwrap_or_default()
 }
 
+/// Convert a BigQuery JSON row (from the `rows[].f[].v` structure) directly
+/// to Arrow column builders.
+///
+/// Each `bq_row` is expected to be a JSON object with an `"f"` array whose
+/// elements have a `"v"` field containing the cell value. Uses [`SimpleType`]
+/// from `columns` to guide type-aware conversion via the shared
+/// [`crate::arrow_builder::json_value_to_arrow`].
+pub(crate) fn bigquery_row_to_arrow(
+    bq_row: &Value,
+    columns: &[crate::provider::ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    let cells = bq_row
+        .get("f")
+        .and_then(|f| f.as_array());
+
+    for (idx, col) in columns.iter().enumerate() {
+        let value = cells
+            .and_then(|c| c.get(idx))
+            .and_then(|cell| cell.get("v"))
+            .unwrap_or(&Value::Null);
+
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
+}
+
 // ---------------------------------------------------------------------------
 // Error parsing helpers
 // ---------------------------------------------------------------------------
