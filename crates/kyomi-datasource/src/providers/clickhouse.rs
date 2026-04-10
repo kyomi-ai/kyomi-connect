@@ -302,13 +302,6 @@ impl DatasourceProvider for ClickHouseProvider {
 
         let prepared = super::sqlx_common::prepare_query(sql, limit, offset);
 
-        // Get total count if requested (only for SELECT/WITH queries)
-        let total_rows = if prepared.is_select && include_total {
-            get_total_count(self, &prepared.sql_stripped).await
-        } else {
-            None
-        };
-
         let paginated_sql = &prepared.sql;
         let effective_limit = limit.unwrap_or(1000);
 
@@ -438,6 +431,17 @@ impl DatasourceProvider for ClickHouseProvider {
 
         let has_more = rows.len() == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
+
+        // ClickHouse includes `rows_before_limit_at_least` in the response
+        // metadata — the pre-LIMIT total row count at zero extra cost.
+        // No separate COUNT(*) query needed.
+        let total_rows = if include_total {
+            parsed
+                .get("rows_before_limit_at_least")
+                .and_then(|v| v.as_i64())
+        } else {
+            None
+        };
 
         Ok(QueryResult {
             status: QueryStatus::Success,
@@ -843,6 +847,12 @@ fn urlencoded(s: &str) -> String {
 ///
 /// Wraps the query in `SELECT COUNT(*) FROM (...) AS _count_subquery`.
 /// Returns `None` silently on failure.
+/// Get the total row count for a query via a separate COUNT(*) query.
+///
+/// Only used by the streaming path (`execute_query_stream`) which uses
+/// `JSONCompactEachRowWithNamesAndTypes` format that doesn't include
+/// `rows_before_limit_at_least`. The non-streaming `execute_query` path
+/// gets the count for free from the JSONCompact response metadata.
 async fn get_total_count(provider: &ClickHouseProvider, sql: &str) -> Option<i64> {
     let count_sql = format!("SELECT COUNT(*) FROM ({sql}) AS _count_subquery");
 
@@ -866,7 +876,6 @@ async fn get_total_count(provider: &ClickHouseProvider, sql: &str) -> Option<i64
         .and_then(|row| row.as_array())
         .and_then(|cols| cols.first())
         .and_then(|v| {
-            // Count may come as number or string
             v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
         })
