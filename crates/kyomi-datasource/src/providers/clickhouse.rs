@@ -33,6 +33,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use futures_util::StreamExt;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use regex::Regex;
 use serde_json::Value;
 
@@ -828,26 +829,14 @@ impl DatasourceProvider for ClickHouseProvider {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Simple URL encoding for query parameters.
+/// Percent-encode a string for use as a URL query parameter value.
 ///
-/// Encodes characters that are not safe in query string values.
+/// Uses `NON_ALPHANUMERIC` from the `percent-encoding` crate, which encodes
+/// every character that is not an ASCII alphanumeric. This covers all
+/// characters unsafe in query parameters including spaces, `&`, `=`, `+`,
+/// `#`, `%`, `?`, `/`, `@`, quotes, backslashes, and control characters.
 fn urlencoded(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            ' ' => result.push_str("%20"),
-            '&' => result.push_str("%26"),
-            '=' => result.push_str("%3D"),
-            '+' => result.push_str("%2B"),
-            '#' => result.push_str("%23"),
-            '%' => result.push_str("%25"),
-            '?' => result.push_str("%3F"),
-            '/' => result.push_str("%2F"),
-            '@' => result.push_str("%40"),
-            _ => result.push(c),
-        }
-    }
-    result
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
 /// Get total row count for a SELECT query.
@@ -1281,5 +1270,18 @@ mod tests {
     #[test]
     fn urlencoded_empty() {
         assert_eq!(urlencoded(""), "");
+    }
+
+    #[test]
+    fn urlencoded_quotes_and_backslashes() {
+        assert_eq!(urlencoded("it's"), "it%27s");
+        assert_eq!(urlencoded(r#"say "hi""#), "say%20%22hi%22");
+        assert_eq!(urlencoded(r"path\to"), "path%5Cto");
+    }
+
+    #[test]
+    fn urlencoded_control_chars() {
+        assert_eq!(urlencoded("line\nbreak"), "line%0Abreak");
+        assert_eq!(urlencoded("tab\there"), "tab%09here");
     }
 }

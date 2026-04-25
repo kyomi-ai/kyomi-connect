@@ -53,6 +53,9 @@ hex = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 
+# URL encoding
+percent-encoding = { workspace = true }
+
 # Error parsing
 regex = { workspace = true }
 
