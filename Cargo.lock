@@ -1943,6 +1943,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "kyomi-connect-protocol",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rsa 0.9.10",
