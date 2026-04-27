@@ -313,6 +313,43 @@ impl ArrowResultBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// IPC helper functions
+// ---------------------------------------------------------------------------
+
+/// Serialize an Arrow [`Schema`] to IPC bytes using the streaming format.
+///
+/// The output contains a schema message only (no record batch data). It can be
+/// read back with `arrow::ipc::reader::StreamReader` to recover the schema.
+///
+/// Used by the Connect wire protocol to populate `ArrowHeader::schema_ipc`.
+pub fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, arrow::error::ArrowError> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, schema)?;
+        // Finish immediately — we only want the schema preamble, no data batches.
+        writer.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Serialize a [`RecordBatch`] to Arrow IPC streaming bytes.
+///
+/// The output uses the IPC streaming format: a schema message followed by one
+/// data batch message. It can be read back with
+/// `arrow::ipc::reader::StreamReader`.
+///
+/// Used by the Connect wire protocol to populate `ArrowBatch::ipc_bytes`.
+pub fn batch_to_ipc_bytes(batch: &RecordBatch) -> Result<Vec<u8>, arrow::error::ArrowError> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, batch.schema_ref())?;
+        writer.write(batch)?;
+        writer.finish()?;
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Shared JSON-to-Arrow conversion for REST API providers
 // ---------------------------------------------------------------------------
 
@@ -942,5 +979,67 @@ mod tests {
         let batch = builder.finish().unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 1);
+    }
+
+    // -- IPC helper functions -------------------------------------------------
+
+    #[test]
+    fn schema_to_ipc_bytes_produces_readable_schema() {
+        let columns = make_columns(&[
+            ("id", SimpleType::Number),
+            ("name", SimpleType::String),
+        ]);
+        let builder = ArrowResultBuilder::new(&columns);
+        let schema = builder.schema().as_ref().clone();
+
+        let ipc = schema_to_ipc_bytes(&schema).unwrap();
+        assert!(!ipc.is_empty());
+
+        // Read the schema back — finish() writes an EOS marker so the reader
+        // will return None immediately after opening (no batches).
+        let cursor = std::io::Cursor::new(ipc);
+        let reader = StreamReader::try_new(cursor, None).unwrap();
+        let recovered = reader.schema();
+        assert_eq!(recovered.fields().len(), 2);
+        assert_eq!(recovered.field(0).name(), "id");
+        assert_eq!(recovered.field(1).name(), "name");
+    }
+
+    #[test]
+    fn batch_to_ipc_bytes_roundtrip() {
+        let columns = make_columns(&[
+            ("val", SimpleType::Number),
+            ("label", SimpleType::String),
+        ]);
+        let mut builder = ArrowResultBuilder::new(&columns);
+        builder.append_f64(0, 1.5);
+        builder.append_string(1, "hello");
+        builder.finish_row();
+
+        let batch = builder.finish().unwrap();
+        let ipc = batch_to_ipc_bytes(&batch).unwrap();
+        assert!(!ipc.is_empty());
+
+        let cursor = std::io::Cursor::new(ipc);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let recovered = reader.next().unwrap().unwrap();
+        assert_eq!(recovered.num_rows(), 1);
+
+        let vals = recovered
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.5).abs() < f64::EPSILON);
+
+        let labels = recovered
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(labels.value(0), "hello");
+
+        // No more batches.
+        assert!(reader.next().is_none());
     }
 }

@@ -2,10 +2,12 @@ use std::str::FromStr;
 
 use futures_util::StreamExt;
 use kyomi_connect_protocol::QueryStreamEvent;
+use kyomi_connect_protocol::stream::QueryFormat;
 use kyomi_connect_protocol::wire::{
     CatalogColumn, CatalogContainer, CatalogResult, CatalogTable, ConnectOp, ConnectRequest,
     ConnectResponse, ConnectResponseBody, DryRunParams, QueryParams,
 };
+use kyomi_datasource::arrow_builder::{batch_to_ipc_bytes, schema_to_ipc_bytes};
 use kyomi_datasource::provider::DatasourceProvider;
 
 /// Streaming threshold: queries requesting more than this many rows (or no
@@ -138,6 +140,80 @@ impl CommandExecutor {
                 }
             };
 
+            // When Arrow format is requested and the provider populated record_batch,
+            // return three Arrow IPC messages: ArrowHeader → ArrowBatch → ArrowComplete.
+            // If record_batch is None (provider didn't populate it), fall through to JSON.
+            if params.format == QueryFormat::Arrow && result.record_batch.is_some() {
+                // Destructure to extract the batch while keeping other fields accessible.
+                let columns = result.columns.unwrap_or_default();
+                let total_rows = result.total_rows;
+                let execution_time_ms = result.execution_time_ms;
+                let bytes_processed = result.bytes_processed;
+                // Safe: we checked is_some() above.
+                let batch = result.record_batch.unwrap();
+                let row_count = batch.num_rows() as u64;
+
+                let schema_ipc = match schema_to_ipc_bytes(batch.schema_ref()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return vec![ConnectResponse {
+                            id: request_id.to_string(),
+                            body: ConnectResponseBody::Error {
+                                error: format!("Arrow schema serialization failed: {e}"),
+                            },
+                        }];
+                    }
+                };
+
+                let ipc_bytes = match batch_to_ipc_bytes(&batch) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return vec![ConnectResponse {
+                            id: request_id.to_string(),
+                            body: ConnectResponseBody::Error {
+                                error: format!("Arrow batch serialization failed: {e}"),
+                            },
+                        }];
+                    }
+                };
+
+                return vec![
+                    ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowHeader {
+                            schema_ipc,
+                            columns,
+                            total_rows,
+                        },
+                    },
+                    ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowBatch {
+                            ipc_bytes,
+                            chunk_index: 0,
+                        },
+                    },
+                    ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowComplete {
+                            execution_time_ms,
+                            bytes_processed,
+                            total_chunks: 1,
+                            total_rows_returned: row_count,
+                        },
+                    },
+                ];
+            }
+
+            if params.format == QueryFormat::Arrow {
+                // record_batch is None — provider didn't build Arrow data.
+                // Fall through to JSON path below.
+                tracing::debug!(
+                    "Arrow format requested but provider did not populate record_batch; \
+                     falling back to JSON"
+                );
+            }
+
             let value = match serde_json::to_value(&result) {
                 Ok(v) => v,
                 Err(e) => {
@@ -166,6 +242,11 @@ impl CommandExecutor {
         request_id: &str,
         params: &QueryParams,
     ) -> Vec<ConnectResponse> {
+        // TODO(Phase 2): When params.format == QueryFormat::Arrow, use an Arrow
+        // streaming path (ArrowHeader → ArrowBatch* → ArrowComplete). This requires
+        // provider-level `execute_query_stream_arrow` methods which don't exist yet.
+        // For now we always use the JSON streaming path regardless of format.
+
         let mut stream = match self
             .provider
             .execute_query_stream(

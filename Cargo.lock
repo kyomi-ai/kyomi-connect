@@ -2131,6 +2131,7 @@ name = "kyomi-connect"
 version = "1.0.3"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-trait",
  "axum",
  "base64 0.22.1",

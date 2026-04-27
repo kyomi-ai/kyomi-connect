@@ -177,7 +177,7 @@ pub enum QueryFormat {
 // ---------------------------------------------------------------------------
 
 /// Serde helper that encodes `Vec<u8>` as base64 for JSON transport.
-mod base64_bytes {
+pub(crate) mod base64_bytes {
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

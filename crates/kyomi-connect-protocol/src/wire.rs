@@ -81,6 +81,10 @@ pub struct QueryParams {
     pub offset: Option<u32>,
     /// Whether to include a total row count (may be slow).
     pub include_total: bool,
+    /// Requested result format. Defaults to [`QueryFormat::Json`] for backward
+    /// compatibility — servers that don't send this field get JSON responses.
+    #[serde(default)]
+    pub format: crate::stream::QueryFormat,
 }
 
 /// Parameters for the `dry_run` operation.
@@ -154,6 +158,47 @@ pub enum ConnectResponseBody {
         /// Total rows across all chunks.
         total_rows_returned: u64,
     },
+    /// Arrow IPC response: schema message with column metadata.
+    ///
+    /// Sent as the first message when [`QueryParams::format`] is
+    /// [`QueryFormat::Arrow`]. The IPC bytes encode the Arrow schema only
+    /// (no row data), allowing the receiver to set up its reader before
+    /// any batch data arrives.
+    ArrowHeader {
+        /// Arrow IPC schema bytes (base64-encoded for JSON transport).
+        #[serde(with = "crate::stream::base64_bytes")]
+        schema_ipc: Vec<u8>,
+        /// Column metadata kept for non-Arrow consumers.
+        columns: Vec<ColumnInfo>,
+        /// Estimated total row count, if available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_rows: Option<i64>,
+    },
+    /// Arrow IPC response: one [`RecordBatch`] as IPC stream bytes.
+    ///
+    /// The IPC bytes use the Arrow streaming format and include the schema
+    /// followed by the batch data. The receiver can read it with
+    /// `arrow::ipc::reader::StreamReader`.
+    ArrowBatch {
+        /// Arrow IPC bytes for one RecordBatch (base64-encoded).
+        #[serde(with = "crate::stream::base64_bytes")]
+        ipc_bytes: Vec<u8>,
+        /// Zero-based chunk index for ordering verification.
+        chunk_index: u32,
+    },
+    /// Arrow IPC response: final summary event, signals end of stream.
+    ArrowComplete {
+        /// Wall-clock execution time in milliseconds.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        execution_time_ms: Option<i64>,
+        /// Bytes processed by the query engine (BigQuery, Snowflake, etc.).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bytes_processed: Option<i64>,
+        /// Total Arrow batches sent.
+        total_chunks: u32,
+        /// Total rows across all batches.
+        total_rows_returned: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +252,7 @@ pub struct CatalogColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::SimpleType;
+    use crate::stream::{QueryFormat, SimpleType};
     use serde_json::json;
 
     // -----------------------------------------------------------------------
@@ -281,6 +326,7 @@ mod tests {
             limit: Some(100),
             offset: None,
             include_total: false,
+            format: QueryFormat::Json,
         };
         let req = ConnectRequest {
             id: "req-1".into(),
@@ -353,6 +399,7 @@ mod tests {
             limit: Some(10),
             offset: Some(0),
             include_total: true,
+            format: QueryFormat::Json,
         };
         let req = ConnectRequest {
             id: "rt-1".into(),
@@ -704,6 +751,7 @@ mod tests {
             limit: Some(50),
             offset: Some(100),
             include_total: true,
+            format: QueryFormat::Json,
         };
         let req = ConnectRequest {
             id: "eq-1".into(),
@@ -911,6 +959,7 @@ mod tests {
             limit: Some(10),
             offset: None,
             include_total: false,
+            format: QueryFormat::Json,
         };
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["sql"], "SELECT 1");
@@ -926,6 +975,7 @@ mod tests {
             limit: Some(100),
             offset: Some(50),
             include_total: true,
+            format: QueryFormat::Json,
         };
         let json = serde_json::to_string(&params).unwrap();
         let parsed: QueryParams = serde_json::from_str(&json).unwrap();
@@ -1074,5 +1124,223 @@ mod tests {
             result.is_err(),
             "expected deserialization to fail for unknown type tag"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // QueryParams.format field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn query_params_format_defaults_to_json_on_deserialize() {
+        // Old wire format without a `format` field — must default to Json.
+        let raw = r#"{"sql":"SELECT 1","include_total":false}"#;
+        let params: QueryParams = serde_json::from_str(raw).unwrap();
+        assert_eq!(params.format, QueryFormat::Json);
+    }
+
+    #[test]
+    fn query_params_format_arrow_roundtrip() {
+        let params = QueryParams {
+            sql: "SELECT 1".into(),
+            limit: None,
+            offset: None,
+            include_total: false,
+            format: QueryFormat::Arrow,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: QueryParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.format, QueryFormat::Arrow);
+    }
+
+    // -----------------------------------------------------------------------
+    // Arrow IPC wire variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn response_arrow_header_serializes_correctly() {
+        use base64::Engine;
+        let schema_bytes = vec![0xAA, 0xBB, 0xCC];
+        let resp = ConnectResponse {
+            id: "ah-1".into(),
+            body: ConnectResponseBody::ArrowHeader {
+                schema_ipc: schema_bytes.clone(),
+                columns: vec![ColumnInfo {
+                    name: "id".into(),
+                    col_type: SimpleType::Number,
+                }],
+                total_rows: Some(500),
+            },
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], "ah-1");
+        assert_eq!(json["type"], "arrow_header");
+        // schema_ipc is base64-encoded
+        let encoded = json["schema_ipc"].as_str().expect("schema_ipc should be a string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(decoded, schema_bytes);
+        assert_eq!(json["columns"][0]["name"], "id");
+        assert_eq!(json["total_rows"], 500);
+    }
+
+    #[test]
+    fn response_arrow_header_omits_null_total_rows() {
+        let resp = ConnectResponse {
+            id: "ah-2".into(),
+            body: ConnectResponseBody::ArrowHeader {
+                schema_ipc: vec![0x01],
+                columns: vec![],
+                total_rows: None,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["type"], "arrow_header");
+        assert!(json.get("total_rows").is_none());
+    }
+
+    #[test]
+    fn response_arrow_batch_serializes_correctly() {
+        use base64::Engine;
+        let ipc_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let resp = ConnectResponse {
+            id: "ab-1".into(),
+            body: ConnectResponseBody::ArrowBatch {
+                ipc_bytes: ipc_data.clone(),
+                chunk_index: 2,
+            },
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], "ab-1");
+        assert_eq!(json["type"], "arrow_batch");
+        assert_eq!(json["chunk_index"], 2);
+        let encoded = json["ipc_bytes"].as_str().expect("ipc_bytes should be a string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(decoded, ipc_data);
+    }
+
+    #[test]
+    fn response_arrow_complete_serializes_correctly() {
+        let resp = ConnectResponse {
+            id: "ac-1".into(),
+            body: ConnectResponseBody::ArrowComplete {
+                execution_time_ms: Some(789),
+                bytes_processed: Some(2_000_000),
+                total_chunks: 3,
+                total_rows_returned: 3000,
+            },
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["id"], "ac-1");
+        assert_eq!(json["type"], "arrow_complete");
+        assert_eq!(json["execution_time_ms"], 789);
+        assert_eq!(json["bytes_processed"], 2_000_000);
+        assert_eq!(json["total_chunks"], 3);
+        assert_eq!(json["total_rows_returned"], 3000);
+    }
+
+    #[test]
+    fn response_arrow_complete_omits_null_optional_fields() {
+        let resp = ConnectResponse {
+            id: "ac-2".into(),
+            body: ConnectResponseBody::ArrowComplete {
+                execution_time_ms: None,
+                bytes_processed: None,
+                total_chunks: 1,
+                total_rows_returned: 10,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["type"], "arrow_complete");
+        assert!(json.get("execution_time_ms").is_none());
+        assert!(json.get("bytes_processed").is_none());
+    }
+
+    #[test]
+    fn response_arrow_header_roundtrip() {
+        let resp = ConnectResponse {
+            id: "rt-ah".into(),
+            body: ConnectResponseBody::ArrowHeader {
+                schema_ipc: vec![0x01, 0x02, 0x03],
+                columns: vec![ColumnInfo {
+                    name: "col".into(),
+                    col_type: SimpleType::String,
+                }],
+                total_rows: Some(99),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "rt-ah");
+        match parsed.body {
+            ConnectResponseBody::ArrowHeader {
+                schema_ipc,
+                columns,
+                total_rows,
+            } => {
+                assert_eq!(schema_ipc, vec![0x01, 0x02, 0x03]);
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "col");
+                assert_eq!(total_rows, Some(99));
+            }
+            other => panic!("expected ArrowHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_arrow_batch_roundtrip() {
+        let resp = ConnectResponse {
+            id: "rt-ab".into(),
+            body: ConnectResponseBody::ArrowBatch {
+                ipc_bytes: vec![0xCA, 0xFE],
+                chunk_index: 5,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
+        match parsed.body {
+            ConnectResponseBody::ArrowBatch {
+                ipc_bytes,
+                chunk_index,
+            } => {
+                assert_eq!(ipc_bytes, vec![0xCA, 0xFE]);
+                assert_eq!(chunk_index, 5);
+            }
+            other => panic!("expected ArrowBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_arrow_complete_roundtrip() {
+        let resp = ConnectResponse {
+            id: "rt-ac".into(),
+            body: ConnectResponseBody::ArrowComplete {
+                execution_time_ms: Some(100),
+                bytes_processed: None,
+                total_chunks: 2,
+                total_rows_returned: 200,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
+        match parsed.body {
+            ConnectResponseBody::ArrowComplete {
+                execution_time_ms,
+                bytes_processed,
+                total_chunks,
+                total_rows_returned,
+            } => {
+                assert_eq!(execution_time_ms, Some(100));
+                assert_eq!(bytes_processed, None);
+                assert_eq!(total_chunks, 2);
+                assert_eq!(total_rows_returned, 200);
+            }
+            other => panic!("expected ArrowComplete, got {other:?}"),
+        }
     }
 }
