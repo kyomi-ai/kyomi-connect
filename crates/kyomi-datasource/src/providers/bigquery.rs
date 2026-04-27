@@ -618,6 +618,31 @@ impl DatasourceProvider for BigQueryProvider {
         // Extract row data from rows[].f[].v
         let rows = extract_bigquery_rows(&result);
 
+        // Build Arrow RecordBatch from the raw BigQuery rows (rows[].f[].v
+        // structure). We iterate result["rows"] directly rather than the
+        // already-extracted Vec<Vec<Value>> so that bigquery_row_to_arrow
+        // can access the native f[].v cell structure it expects.
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            if let Some(raw_rows) = result.get("rows").and_then(|r| r.as_array()) {
+                for bq_row in raw_rows {
+                    bigquery_row_to_arrow(bq_row, &columns, builder);
+                }
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder.finish().map_err(|e| {
+                tracing::warn!(error = %e, "BigQuery Arrow batch construction failed; falling back to JSON-only");
+                e
+            }).ok()
+        });
+
         // Extract total rows from the query response (available at zero cost
         // from the BigQuery API — only conditionally populated based on caller).
         let total_rows = if include_total {
@@ -662,7 +687,7 @@ impl DatasourceProvider for BigQueryProvider {
             bytes_processed,
             execution_time_ms: Some(execution_time_ms),
             error: None,
-            record_batch: None,
+            record_batch,
         })
     }
 

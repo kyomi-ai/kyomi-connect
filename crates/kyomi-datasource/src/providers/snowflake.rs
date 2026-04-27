@@ -552,6 +552,26 @@ impl DatasourceProvider for SnowflakeProvider {
             })
             .unwrap_or_default();
 
+        // Build Arrow RecordBatch from the JSON rows.
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            for row in &rows {
+                snowflake_row_to_arrow(row, &columns, builder);
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder.finish().map_err(|e| {
+                tracing::warn!(error = %e, "Snowflake Arrow batch construction failed; falling back to JSON-only");
+                e
+            }).ok()
+        });
+
         let has_more = rows.len() == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
@@ -564,7 +584,7 @@ impl DatasourceProvider for SnowflakeProvider {
             bytes_processed: None, // Snowflake REST API doesn't easily expose this
             execution_time_ms: Some(execution_time_ms),
             error: None,
-            record_batch: None,
+            record_batch,
         })
     }
 

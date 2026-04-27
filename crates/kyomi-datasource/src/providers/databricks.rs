@@ -492,6 +492,26 @@ impl DatasourceProvider for DatabricksProvider {
 
         let rows = self.fetch_all_chunks(&result, statement_id).await;
 
+        // Build Arrow RecordBatch from the JSON rows.
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            for row in &rows {
+                databricks_row_to_arrow(row, &columns, builder);
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder.finish().map_err(|e| {
+                tracing::warn!(error = %e, "Databricks Arrow batch construction failed; falling back to JSON-only");
+                e
+            }).ok()
+        });
+
         let has_more = limit.is_some_and(|lim| rows.len() == lim as usize);
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
@@ -504,7 +524,7 @@ impl DatasourceProvider for DatabricksProvider {
             bytes_processed: None, // Databricks doesn't expose this easily
             execution_time_ms: Some(execution_time_ms),
             error: None,
-            record_batch: None,
+            record_batch,
         })
     }
 
