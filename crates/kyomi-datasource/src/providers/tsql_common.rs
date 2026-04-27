@@ -312,88 +312,111 @@ pub(crate) fn tds_row_to_arrow(
     builder: &mut crate::arrow_builder::ArrowResultBuilder,
 ) {
     for (idx, col) in columns.iter().enumerate() {
-        match col.col_type {
-            SimpleType::Boolean => match row.try_get::<bool, _>(idx) {
-                Ok(Some(v)) => builder.append_bool(idx, v),
-                _ => builder.append_null(idx),
-            },
-            SimpleType::Number => {
-                // Try i64 → f64 → i32 → i16 → u8 → f32 → Numeric
-                if let Ok(Some(v)) = row.try_get::<i64, _>(idx) {
-                    builder.append_i64(idx, v);
-                } else if let Ok(Some(v)) = row.try_get::<f64, _>(idx) {
-                    builder.append_f64(idx, v);
-                } else if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
-                    builder.append_i64(idx, v as i64);
-                } else if let Ok(Some(v)) = row.try_get::<i16, _>(idx) {
-                    builder.append_i64(idx, v as i64);
-                } else if let Ok(Some(v)) = row.try_get::<u8, _>(idx) {
-                    builder.append_i64(idx, v as i64);
-                } else if let Ok(Some(v)) = row.try_get::<f32, _>(idx) {
-                    builder.append_f64(idx, v as f64);
-                } else if let Ok(Some(v)) = row.try_get::<tiberius::numeric::Numeric, _>(idx) {
-                    let s = format!("{v}");
-                    if let Ok(f) = s.parse::<f64>() {
-                        builder.append_f64(idx, f);
-                    } else {
-                        builder.append_null(idx);
-                    }
+        tds_row_to_arrow_at(row, idx, idx, col.col_type, builder);
+    }
+    builder.finish_row();
+}
+
+/// Append one column value from a tiberius row directly into an Arrow builder.
+///
+/// Unlike [`tds_row_to_arrow`], this function accepts separate indices:
+/// - `col_idx`: the 0-based index into `filtered_columns` (and into the
+///   [`crate::arrow_builder::ArrowResultBuilder`] column slot).
+/// - `row_idx`: the 0-based index into the tiberius [`Row`] (which may differ
+///   from `col_idx` when a `_row_num` pagination column shifts positions).
+///
+/// This separation is necessary when `apply_tsql_pagination` wraps the query
+/// in a `ROW_NUMBER` subquery: `filtered_columns` omits `_row_num` but the
+/// tiberius row retains it, so every column at or after the `_row_num` position
+/// has `row_idx = col_idx + 1`.
+fn tds_row_to_arrow_at(
+    row: &Row,
+    col_idx: usize,
+    row_idx: usize,
+    col_type: SimpleType,
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    match col_type {
+        SimpleType::Boolean => match row.try_get::<bool, _>(row_idx) {
+            Ok(Some(v)) => builder.append_bool(col_idx, v),
+            _ => builder.append_null(col_idx),
+        },
+        SimpleType::Number => {
+            if let Ok(Some(v)) = row.try_get::<i64, _>(row_idx) {
+                builder.append_i64(col_idx, v);
+            } else if let Ok(Some(v)) = row.try_get::<f64, _>(row_idx) {
+                builder.append_f64(col_idx, v);
+            } else if let Ok(Some(v)) = row.try_get::<i32, _>(row_idx) {
+                builder.append_i64(col_idx, v as i64);
+            } else if let Ok(Some(v)) = row.try_get::<i16, _>(row_idx) {
+                builder.append_i64(col_idx, v as i64);
+            } else if let Ok(Some(v)) = row.try_get::<u8, _>(row_idx) {
+                builder.append_i64(col_idx, v as i64);
+            } else if let Ok(Some(v)) = row.try_get::<f32, _>(row_idx) {
+                builder.append_f64(col_idx, v as f64);
+            } else if let Ok(Some(v)) =
+                row.try_get::<tiberius::numeric::Numeric, _>(row_idx)
+            {
+                let s = format!("{v}");
+                if let Ok(f) = s.parse::<f64>() {
+                    builder.append_f64(col_idx, f);
                 } else {
-                    builder.append_null(idx);
+                    builder.append_null(col_idx);
                 }
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::String => {
-                if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
-                    builder.append_string(idx, v);
-                } else if let Ok(Some(v)) = row.try_get::<tiberius::Uuid, _>(idx) {
-                    builder.append_string(idx, &v.to_string());
-                } else if let Ok(Some(v)) = row.try_get::<&[u8], _>(idx) {
-                    builder.append_string(idx, &hex_encode(v));
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::String => {
+            if let Ok(Some(v)) = row.try_get::<&str, _>(row_idx) {
+                builder.append_string(col_idx, v);
+            } else if let Ok(Some(v)) = row.try_get::<tiberius::Uuid, _>(row_idx) {
+                builder.append_string(col_idx, &v.to_string());
+            } else if let Ok(Some(v)) = row.try_get::<&[u8], _>(row_idx) {
+                builder.append_string(col_idx, &hex_encode(v));
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::Date => {
-                if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(idx) {
-                    builder.append_naive_date(idx, v);
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::Date => {
+            if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(row_idx) {
+                builder.append_naive_date(col_idx, v);
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::Time => {
-                if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(idx) {
-                    builder.append_naive_time(idx, v);
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::Time => {
+            if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(row_idx) {
+                builder.append_naive_time(col_idx, v);
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::Timestamp => {
-                if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
-                    builder.append_naive_datetime(idx, v);
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::Timestamp => {
+            if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(row_idx) {
+                builder.append_naive_datetime(col_idx, v);
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::TimestampTz => {
-                if let Ok(Some(v)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(idx) {
-                    builder.append_datetime_utc(idx, v);
-                } else if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
-                    // Don't silently assert UTC — store as string like the JSON path
-                    builder.append_string(idx, &v.format("%Y-%m-%dT%H:%M:%S").to_string());
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::TimestampTz => {
+            if let Ok(Some(v)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(row_idx) {
+                builder.append_datetime_utc(col_idx, v);
+            } else if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(row_idx) {
+                // Don't silently assert UTC — store as string like the JSON path
+                builder.append_string(col_idx, &v.format("%Y-%m-%dT%H:%M:%S").to_string());
+            } else {
+                builder.append_null(col_idx);
             }
-            SimpleType::Unknown => {
-                if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
-                    builder.append_string(idx, v);
-                } else {
-                    builder.append_null(idx);
-                }
+        }
+        SimpleType::Unknown => {
+            if let Ok(Some(v)) = row.try_get::<&str, _>(row_idx) {
+                builder.append_string(col_idx, v);
+            } else {
+                builder.append_null(col_idx);
             }
         }
     }
-    builder.finish_row();
 }
 
 // ---------------------------------------------------------------------------
@@ -539,20 +562,52 @@ pub(crate) async fn execute_tds_query(
         columns
     };
 
-    // Convert rows to JSON values
+    // Build Arrow RecordBatch alongside JSON rows (only when there are columns).
+    let mut arrow_builder = if !filtered_columns.is_empty() {
+        Some(crate::arrow_builder::ArrowResultBuilder::new(&filtered_columns))
+    } else {
+        None
+    };
+
+    // Convert rows to JSON values and populate the Arrow builder in one pass.
+    //
+    // When ROW_NUMBER pagination added a `_row_num` column, filtered_columns
+    // excludes it but the tiberius row still has it at position `row_num_idx`.
+    // We use `actual_idx` to address the tiberius row and `i` to address the
+    // filtered column / Arrow builder slot.
     let mut json_rows = Vec::with_capacity(rows_result.len());
     for row in &rows_result {
         let mut row_values = Vec::with_capacity(filtered_columns.len());
         for (i, col_info) in filtered_columns.iter().enumerate() {
-            // Adjust index if _row_num column was before this position
+            // Adjust tiberius row index if _row_num column was before this position
             let actual_idx = match row_num_idx {
                 Some(rn_idx) if i >= rn_idx => i + 1,
                 _ => i,
             };
             row_values.push(tds_row_value_to_json(row, actual_idx, col_info.col_type));
+
+            if let Some(ref mut builder) = arrow_builder {
+                tds_row_to_arrow_at(row, i, actual_idx, col_info.col_type, builder);
+            }
         }
         json_rows.push(row_values);
+        if let Some(ref mut builder) = arrow_builder {
+            builder.finish_row();
+        }
     }
+
+    let record_batch = arrow_builder.and_then(|builder| {
+        builder
+            .finish()
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "{provider_name} Arrow batch construction failed; falling back to JSON-only"
+                );
+                e
+            })
+            .ok()
+    });
 
     let has_more = json_rows.len() == effective_limit as usize;
     let execution_time_ms = start.elapsed().as_millis() as i64;
@@ -566,7 +621,7 @@ pub(crate) async fn execute_tds_query(
         bytes_processed: None,
         execution_time_ms: Some(execution_time_ms),
         error: None,
-        record_batch: None,
+        record_batch,
     })
 }
 
