@@ -124,6 +124,7 @@ pub async fn collect_stream_to_result(
         bytes_processed,
         execution_time_ms,
         error: None,
+        record_batch: None,
     })
 }
 
@@ -159,6 +160,7 @@ mod tests {
             bytes_processed: Some(5_000_000),
             execution_time_ms: Some(42),
             error: None,
+            record_batch: None,
         }
     }
 

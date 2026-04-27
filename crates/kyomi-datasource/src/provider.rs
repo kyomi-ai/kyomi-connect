@@ -68,6 +68,11 @@ impl<'de> Deserialize<'de> for QueryStatus {
 /// Supports pagination with `total_rows` and `has_more` indicators.
 ///
 /// Wire-compatible with Python's `QueryResult` dataclass.
+///
+/// In addition to the JSON `rows` field, `record_batch` carries the same data
+/// in Arrow columnar format for consumers that can use it directly (e.g., the
+/// Arrow-native export pipeline). The field is excluded from serialization
+/// because `RecordBatch` is not serde-serializable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     /// `"success"` or `"error"`.
@@ -86,6 +91,10 @@ pub struct QueryResult {
     pub execution_time_ms: Option<i64>,
     /// Error message if `status == "error"`.
     pub error: Option<String>,
+    /// Arrow columnar representation of the same rows, populated by providers
+    /// that implement native Arrow conversion. Skipped during serialization.
+    #[serde(skip)]
+    pub record_batch: Option<arrow::record_batch::RecordBatch>,
 }
 
 impl QueryResult {
@@ -101,6 +110,7 @@ impl QueryResult {
             bytes_processed: None,
             execution_time_ms: None,
             error: None,
+            record_batch: None,
         }
     }
 
@@ -116,6 +126,7 @@ impl QueryResult {
             bytes_processed: None,
             execution_time_ms: None,
             error: Some(message.into()),
+            record_batch: None,
         }
     }
 }
@@ -399,6 +410,7 @@ mod tests {
             bytes_processed: Some(5_000_000),
             execution_time_ms: Some(1234),
             error: None,
+            record_batch: None,
         };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json["status"], "success");

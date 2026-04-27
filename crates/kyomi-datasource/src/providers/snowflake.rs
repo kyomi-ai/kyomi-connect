@@ -501,6 +501,7 @@ impl DatasourceProvider for SnowflakeProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
         };
@@ -563,6 +564,7 @@ impl DatasourceProvider for SnowflakeProvider {
             bytes_processed: None, // Snowflake REST API doesn't easily expose this
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch: None,
         })
     }
 

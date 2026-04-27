@@ -272,6 +272,7 @@ impl DatasourceProvider for RedshiftProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
             Err(_) => {
@@ -287,6 +288,7 @@ impl DatasourceProvider for RedshiftProvider {
                         "Query timed out after {}s",
                         crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
                     )),
+                    record_batch: None,
                 });
             }
         };
@@ -308,7 +310,15 @@ impl DatasourceProvider for RedshiftProvider {
             Vec::new()
         };
 
+        // Build Arrow RecordBatch alongside JSON rows (only when there are rows).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
         // Convert rows to JSON (reuse PostgreSQL row conversion since wire format is the same)
+        // and populate the Arrow builder in one pass.
         let mut json_rows = Vec::with_capacity(rows_result.len());
         for row in &rows_result {
             let mut row_values = Vec::with_capacity(columns.len());
@@ -317,7 +327,18 @@ impl DatasourceProvider for RedshiftProvider {
                 row_values.push(value);
             }
             json_rows.push(row_values);
+
+            if let Some(ref mut builder) = arrow_builder {
+                redshift_row_to_arrow(row, &columns, builder);
+            }
         }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder.finish().map_err(|e| {
+                tracing::warn!(error = %e, "Redshift Arrow batch construction failed; falling back to JSON-only");
+                e
+            }).ok()
+        });
 
         let has_more = json_rows.len() == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
@@ -331,6 +352,7 @@ impl DatasourceProvider for RedshiftProvider {
             bytes_processed: None,
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 

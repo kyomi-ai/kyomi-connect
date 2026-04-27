@@ -586,6 +586,7 @@ impl DatasourceProvider for BigQueryProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
         };
@@ -661,6 +662,7 @@ impl DatasourceProvider for BigQueryProvider {
             bytes_processed,
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch: None,
         })
     }
 

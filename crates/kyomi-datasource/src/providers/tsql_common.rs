@@ -471,6 +471,7 @@ pub(crate) async fn execute_tds_query(
                 bytes_processed: None,
                 execution_time_ms: Some(start.elapsed().as_millis() as i64),
                 error: Some(e.to_string()),
+                record_batch: None,
             });
         }
         Err(_) => {
@@ -486,6 +487,7 @@ pub(crate) async fn execute_tds_query(
                     "Query timed out after {}s",
                     crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
                 )),
+                record_batch: None,
             });
         }
     };
@@ -504,6 +506,7 @@ pub(crate) async fn execute_tds_query(
                 bytes_processed: None,
                 execution_time_ms: Some(start.elapsed().as_millis() as i64),
                 error: Some(e.to_string()),
+                record_batch: None,
             });
         }
     };
@@ -563,6 +566,7 @@ pub(crate) async fn execute_tds_query(
         bytes_processed: None,
         execution_time_ms: Some(execution_time_ms),
         error: None,
+        record_batch: None,
     })
 }
 
