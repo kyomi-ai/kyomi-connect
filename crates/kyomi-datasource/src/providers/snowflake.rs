@@ -552,7 +552,7 @@ impl DatasourceProvider for SnowflakeProvider {
             })
             .unwrap_or_default();
 
-        // Build Arrow RecordBatch from the JSON rows.
+        // Build Arrow RecordBatch from the JSON rows (sole data path).
         let mut arrow_builder = if !columns.is_empty() {
             Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
         } else {
@@ -567,18 +567,19 @@ impl DatasourceProvider for SnowflakeProvider {
 
         let record_batch = arrow_builder.and_then(|builder| {
             builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "Snowflake Arrow batch construction failed; falling back to JSON-only");
+                tracing::warn!(error = %e, "Snowflake Arrow batch construction failed");
                 e
             }).ok()
         });
 
-        let has_more = rows.len() == effective_limit as usize;
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None, // Snowflake REST API doesn't easily expose this
@@ -607,25 +608,21 @@ impl DatasourceProvider for SnowflakeProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| {
-                        // SHOW DATABASES returns: (created_on, name, is_default, is_current, origin, owner, ...)
-                        // name is at index 1
-                        row.get(1).and_then(|v| v.as_str()).map(String::from)
-                    })
-                    .filter(|name| {
-                        let upper = name.to_uppercase();
-                        upper != "SNOWFLAKE" && upper != "SNOWFLAKE_SAMPLE_DATA"
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
+                // SHOW DATABASES returns: (created_on, name, is_default, is_current, origin, owner, ...)
+                // name is at index 1
+                let mut items: Vec<String> = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    1,
+                )
+                .into_iter()
+                .filter(|name| {
+                    let upper = name.to_uppercase();
+                    upper != "SNOWFLAKE" && upper != "SNOWFLAKE_SAMPLE_DATA"
+                })
+                .collect();
+                items.sort();
                 crate::provider::DiscoveryResult {
-                    items: sorted,
+                    items,
                     error: None,
                 }
             }
@@ -642,21 +639,15 @@ impl DatasourceProvider for SnowflakeProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| {
-                        // SHOW WAREHOUSES returns: (name, state, type, size, ...)
-                        // name is at index 0
-                        row.first().and_then(|v| v.as_str()).map(String::from)
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
+                // SHOW WAREHOUSES returns: (name, state, type, size, ...)
+                // name is at index 0
+                let mut items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
+                items.sort();
                 crate::provider::DiscoveryResult {
-                    items: sorted,
+                    items,
                     error: None,
                 }
             }

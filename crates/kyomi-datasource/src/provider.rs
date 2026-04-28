@@ -6,6 +6,7 @@
 //!
 //! Wire-compatible with the Python `datasources/base.py` result types.
 
+use arrow::array::Array;
 use serde::{Deserialize, Serialize, Serializer};
 
 // ---------------------------------------------------------------------------
@@ -192,6 +193,46 @@ pub struct DiscoveryResult {
     pub items: Vec<String>,
     /// Error message if discovery failed; `None` on success.
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Arrow batch helpers
+// ---------------------------------------------------------------------------
+
+/// Extract string values from a single column of an Arrow [`RecordBatch`].
+///
+/// Used by discovery methods (`list_databases`, `list_schemas`, etc.) that
+/// call `execute_query` and then need to read text values out of the result.
+/// Now that `execute_query` sets `rows: None`, callers must read from
+/// `record_batch` instead.
+///
+/// Returns an empty `Vec` if the batch is `None` or the column index is out
+/// of range. Only works for `Utf8` (string) columns.
+pub fn extract_string_col_from_batch(
+    batch: Option<&arrow::record_batch::RecordBatch>,
+    col_idx: usize,
+) -> Vec<String> {
+    let Some(batch) = batch else {
+        return Vec::new();
+    };
+    if col_idx >= batch.num_columns() {
+        return Vec::new();
+    }
+    let col = batch.column(col_idx);
+    col.as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .map(|arr| {
+            (0..arr.len())
+                .filter_map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

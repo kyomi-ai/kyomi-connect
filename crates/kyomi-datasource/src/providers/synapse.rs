@@ -393,13 +393,10 @@ impl DatasourceProvider for SynapseProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -426,13 +423,10 @@ impl DatasourceProvider for SynapseProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {

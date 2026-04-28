@@ -615,13 +615,9 @@ impl DatasourceProvider for BigQueryProvider {
             })
             .unwrap_or_default();
 
-        // Extract row data from rows[].f[].v
-        let rows = extract_bigquery_rows(&result);
-
-        // Build Arrow RecordBatch from the raw BigQuery rows (rows[].f[].v
-        // structure). We iterate result["rows"] directly rather than the
-        // already-extracted Vec<Vec<Value>> so that bigquery_row_to_arrow
-        // can access the native f[].v cell structure it expects.
+        // Build Arrow RecordBatch (the sole data path — JSON rows are not populated).
+        // We iterate result["rows"] directly so bigquery_row_to_arrow can access
+        // the native f[].v cell structure it expects.
         let mut arrow_builder = if !columns.is_empty() {
             Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
         } else {
@@ -638,7 +634,7 @@ impl DatasourceProvider for BigQueryProvider {
 
         let record_batch = arrow_builder.and_then(|builder| {
             builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "BigQuery Arrow batch construction failed; falling back to JSON-only");
+                tracing::warn!(error = %e, "BigQuery Arrow batch construction failed");
                 e
             }).ok()
         });
@@ -675,13 +671,14 @@ impl DatasourceProvider for BigQueryProvider {
             });
 
         let effective_limit = limit.unwrap_or(1000);
-        let has_more = rows.len() == effective_limit as usize;
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed,

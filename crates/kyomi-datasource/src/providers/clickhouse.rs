@@ -432,7 +432,7 @@ impl DatasourceProvider for ClickHouseProvider {
             })
             .unwrap_or_default();
 
-        // Build Arrow RecordBatch from the coerced JSON rows.
+        // Build Arrow RecordBatch from the coerced JSON rows (sole data path).
         let mut arrow_builder = if !columns.is_empty() {
             Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
         } else {
@@ -447,12 +447,13 @@ impl DatasourceProvider for ClickHouseProvider {
 
         let record_batch = arrow_builder.and_then(|builder| {
             builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "ClickHouse Arrow batch construction failed; falling back to JSON-only");
+                tracing::warn!(error = %e, "ClickHouse Arrow batch construction failed");
                 e
             }).ok()
         });
 
-        let has_more = rows.len() == effective_limit as usize;
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         // ClickHouse includes `rows_before_limit_at_least` in the response
@@ -469,7 +470,7 @@ impl DatasourceProvider for ClickHouseProvider {
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed,
@@ -511,13 +512,10 @@ impl DatasourceProvider for ClickHouseProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {

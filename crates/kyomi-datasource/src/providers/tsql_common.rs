@@ -562,36 +562,27 @@ pub(crate) async fn execute_tds_query(
         columns
     };
 
-    // Build Arrow RecordBatch alongside JSON rows (only when there are columns).
+    // Build Arrow RecordBatch (the sole data path — JSON rows are not populated).
+    //
+    // When ROW_NUMBER pagination added a `_row_num` column, filtered_columns
+    // excludes it but the tiberius row still has it at position `row_num_idx`.
+    // We use `actual_idx` to address the tiberius row and `i` to address the
+    // filtered column / Arrow builder slot.
     let mut arrow_builder = if !filtered_columns.is_empty() {
         Some(crate::arrow_builder::ArrowResultBuilder::new(&filtered_columns))
     } else {
         None
     };
 
-    // Convert rows to JSON values and populate the Arrow builder in one pass.
-    //
-    // When ROW_NUMBER pagination added a `_row_num` column, filtered_columns
-    // excludes it but the tiberius row still has it at position `row_num_idx`.
-    // We use `actual_idx` to address the tiberius row and `i` to address the
-    // filtered column / Arrow builder slot.
-    let mut json_rows = Vec::with_capacity(rows_result.len());
     for row in &rows_result {
-        let mut row_values = Vec::with_capacity(filtered_columns.len());
-        for (i, col_info) in filtered_columns.iter().enumerate() {
-            // Adjust tiberius row index if _row_num column was before this position
-            let actual_idx = match row_num_idx {
-                Some(rn_idx) if i >= rn_idx => i + 1,
-                _ => i,
-            };
-            row_values.push(tds_row_value_to_json(row, actual_idx, col_info.col_type));
-
-            if let Some(ref mut builder) = arrow_builder {
+        if let Some(ref mut builder) = arrow_builder {
+            for (i, col_info) in filtered_columns.iter().enumerate() {
+                let actual_idx = match row_num_idx {
+                    Some(rn_idx) if i >= rn_idx => i + 1,
+                    _ => i,
+                };
                 tds_row_to_arrow_at(row, i, actual_idx, col_info.col_type, builder);
             }
-        }
-        json_rows.push(row_values);
-        if let Some(ref mut builder) = arrow_builder {
             builder.finish_row();
         }
     }
@@ -602,20 +593,21 @@ pub(crate) async fn execute_tds_query(
             .map_err(|e| {
                 tracing::warn!(
                     error = %e,
-                    "{provider_name} Arrow batch construction failed; falling back to JSON-only"
+                    "{provider_name} Arrow batch construction failed"
                 );
                 e
             })
             .ok()
     });
 
-    let has_more = json_rows.len() == effective_limit as usize;
+    let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+    let has_more = row_count == effective_limit as usize;
     let execution_time_ms = start.elapsed().as_millis() as i64;
 
     Ok(QueryResult {
         status: QueryStatus::Success,
         columns: Some(filtered_columns),
-        rows: Some(json_rows),
+        rows: None,
         total_rows,
         has_more,
         bytes_processed: None,

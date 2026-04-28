@@ -492,7 +492,7 @@ impl DatasourceProvider for DatabricksProvider {
 
         let rows = self.fetch_all_chunks(&result, statement_id).await;
 
-        // Build Arrow RecordBatch from the JSON rows.
+        // Build Arrow RecordBatch from the JSON rows (sole data path).
         let mut arrow_builder = if !columns.is_empty() {
             Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
         } else {
@@ -507,18 +507,19 @@ impl DatasourceProvider for DatabricksProvider {
 
         let record_batch = arrow_builder.and_then(|builder| {
             builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "Databricks Arrow batch construction failed; falling back to JSON-only");
+                tracing::warn!(error = %e, "Databricks Arrow batch construction failed");
                 e
             }).ok()
         });
 
-        let has_more = limit.is_some_and(|lim| rows.len() == lim as usize);
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = limit.is_some_and(|lim| row_count == lim as usize);
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None, // Databricks doesn't expose this easily
@@ -544,21 +545,19 @@ impl DatasourceProvider for DatabricksProvider {
     async fn list_catalogs(&self) -> crate::provider::DiscoveryResult {
         match self.execute_query("SHOW CATALOGS", None, None, false).await {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .filter(|name| {
-                        let lower = name.to_lowercase();
-                        lower != "system" && lower != "hive_metastore"
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
+                let mut items: Vec<String> = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                )
+                .into_iter()
+                .filter(|name| {
+                    let lower = name.to_lowercase();
+                    lower != "system" && lower != "hive_metastore"
+                })
+                .collect();
+                items.sort();
                 crate::provider::DiscoveryResult {
-                    items: sorted,
+                    items,
                     error: None,
                 }
             }

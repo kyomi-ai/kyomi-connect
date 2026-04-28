@@ -310,24 +310,14 @@ impl DatasourceProvider for RedshiftProvider {
             Vec::new()
         };
 
-        // Build Arrow RecordBatch alongside JSON rows (only when there are rows).
+        // Build Arrow RecordBatch (the sole data path — JSON rows are not populated).
         let mut arrow_builder = if !columns.is_empty() {
             Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
         } else {
             None
         };
 
-        // Convert rows to JSON (reuse PostgreSQL row conversion since wire format is the same)
-        // and populate the Arrow builder in one pass.
-        let mut json_rows = Vec::with_capacity(rows_result.len());
         for row in &rows_result {
-            let mut row_values = Vec::with_capacity(columns.len());
-            for (i, col_info) in columns.iter().enumerate() {
-                let value = pg_row_value_to_json(row, i, col_info.col_type);
-                row_values.push(value);
-            }
-            json_rows.push(row_values);
-
             if let Some(ref mut builder) = arrow_builder {
                 redshift_row_to_arrow(row, &columns, builder);
             }
@@ -335,18 +325,19 @@ impl DatasourceProvider for RedshiftProvider {
 
         let record_batch = arrow_builder.and_then(|builder| {
             builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "Redshift Arrow batch construction failed; falling back to JSON-only");
+                tracing::warn!(error = %e, "Redshift Arrow batch construction failed");
                 e
             }).ok()
         });
 
-        let has_more = json_rows.len() == effective_limit as usize;
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(json_rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None,
@@ -461,13 +452,10 @@ impl DatasourceProvider for RedshiftProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
                 crate::provider::DiscoveryResult {
                     items,
                     error: None,
