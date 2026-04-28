@@ -369,6 +369,37 @@ pub trait DatasourceProvider: Send + Sync {
         crate::stream::query_result_to_stream(result)
     }
 
+    /// Execute a SQL query and return results as a stream of Arrow IPC events.
+    ///
+    /// The default implementation calls [`execute_query`](Self::execute_query)
+    /// and wraps the result using
+    /// [`query_result_to_arrow_stream`](crate::stream::query_result_to_arrow_stream).
+    /// All rows are delivered in a single batch.
+    ///
+    /// Providers that support native streaming (e.g., PostgreSQL, MySQL, Redshift)
+    /// should override this to yield rows in multiple batches via
+    /// [`crate::providers::sqlx_common::drive_sqlx_stream_arrow`].
+    ///
+    /// # Arguments
+    /// * `sql` - SQL query to execute.
+    /// * `limit` - Maximum rows to return. `None` for no limit.
+    /// * `offset` - Number of rows to skip. `None` for no offset.
+    /// * `include_total` - If `true`, include total row count estimate.
+    /// * `_chunk_size` - Target rows per batch (unused in default impl).
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        include_total: bool,
+        _chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        let result = self
+            .execute_query(sql, limit, offset, include_total)
+            .await?;
+        crate::stream::query_result_to_arrow_stream(result)
+    }
+
     /// Clean up any open connections or resources.
     ///
     /// Called when the provider is no longer needed. Implementations should

@@ -38,7 +38,7 @@ pub use provider::{
     ColumnInfo, DatasourceProvider, DiscoveryResult, DryRunResult, QueryResult, QueryStatus,
     SimpleType,
 };
-pub use stream::{collect_stream_to_result, query_result_to_stream};
+pub use stream::{collect_stream_to_result, query_result_to_arrow_stream, query_result_to_stream};
 
 // ---------------------------------------------------------------------------
 // Timeout constants

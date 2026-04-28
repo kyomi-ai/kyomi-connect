@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use futures_util::StreamExt;
+use kyomi_connect_protocol::ArrowStreamEvent;
 use kyomi_connect_protocol::QueryStreamEvent;
 use kyomi_connect_protocol::stream::QueryFormat;
 use kyomi_connect_protocol::wire::{
@@ -237,16 +238,20 @@ impl CommandExecutor {
     }
 
     /// Execute a query via the streaming provider path, returning multiple responses.
+    ///
+    /// When `params.format == QueryFormat::Arrow`, uses the Arrow streaming path
+    /// (`ArrowHeader` → `ArrowBatch*` → `ArrowComplete`). Otherwise uses the
+    /// JSON streaming path (`StreamHeader` → `StreamChunk*` → `StreamComplete`).
     async fn execute_query_streaming(
         &self,
         request_id: &str,
         params: &QueryParams,
     ) -> Vec<ConnectResponse> {
-        // TODO(Phase 2): When params.format == QueryFormat::Arrow, use an Arrow
-        // streaming path (ArrowHeader → ArrowBatch* → ArrowComplete). This requires
-        // provider-level `execute_query_stream_arrow` methods which don't exist yet.
-        // For now we always use the JSON streaming path regardless of format.
+        if params.format == QueryFormat::Arrow {
+            return self.execute_query_streaming_arrow(request_id, params).await;
+        }
 
+        // JSON streaming path (backward compatibility)
         let mut stream = match self
             .provider
             .execute_query_stream(
@@ -300,6 +305,97 @@ impl CommandExecutor {
                     responses.push(ConnectResponse {
                         id: request_id.to_string(),
                         body: ConnectResponseBody::StreamComplete {
+                            execution_time_ms,
+                            bytes_processed,
+                            total_chunks,
+                            total_rows_returned,
+                        },
+                    });
+                }
+                Err(e) => {
+                    // Mid-stream error: send Error response and stop
+                    responses.push(ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::Error {
+                            error: e.to_string(),
+                        },
+                    });
+                    break;
+                }
+            }
+        }
+
+        responses
+    }
+
+    /// Execute a query via the Arrow streaming path, returning multiple responses
+    /// (`ArrowHeader` → `ArrowBatch*` → `ArrowComplete`).
+    async fn execute_query_streaming_arrow(
+        &self,
+        request_id: &str,
+        params: &QueryParams,
+    ) -> Vec<ConnectResponse> {
+        let mut stream = match self
+            .provider
+            .execute_query_stream_arrow(
+                &params.sql,
+                params.limit,
+                params.offset,
+                params.include_total,
+                None, // Use default chunk size
+            )
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return vec![ConnectResponse {
+                    id: request_id.to_string(),
+                    body: ConnectResponseBody::Error {
+                        error: e.to_string(),
+                    },
+                }];
+            }
+        };
+
+        let mut responses = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(ArrowStreamEvent::Schema {
+                    schema_ipc,
+                    columns,
+                    total_rows,
+                }) => {
+                    responses.push(ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowHeader {
+                            schema_ipc,
+                            columns,
+                            total_rows,
+                        },
+                    });
+                }
+                Ok(ArrowStreamEvent::Batch {
+                    ipc_bytes,
+                    chunk_index,
+                }) => {
+                    responses.push(ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowBatch {
+                            ipc_bytes,
+                            chunk_index,
+                        },
+                    });
+                }
+                Ok(ArrowStreamEvent::Complete {
+                    execution_time_ms,
+                    bytes_processed,
+                    total_chunks,
+                    total_rows_returned,
+                }) => {
+                    responses.push(ConnectResponse {
+                        id: request_id.to_string(),
+                        body: ConnectResponseBody::ArrowComplete {
                             execution_time_ms,
                             bytes_processed,
                             total_chunks,

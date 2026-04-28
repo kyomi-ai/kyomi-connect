@@ -412,6 +412,69 @@ impl DatasourceProvider for RedshiftProvider {
         Ok(stream)
     }
 
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        include_total: bool,
+        chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        let start = Instant::now();
+        let chunk_size = chunk_size.unwrap_or(100) as usize;
+
+        let prepared = sqlx_common::prepare_query(sql, limit, offset);
+
+        // Get total count if requested (only for SELECT/WITH queries)
+        let total_rows = if prepared.is_select && include_total {
+            get_total_count(&self.pool, &prepared.sql_stripped).await
+        } else {
+            None
+        };
+
+        tracing::debug!(
+            sql = %prepared.sql.chars().take(200).collect::<String>(),
+            "Arrow-streaming Redshift query"
+        );
+
+        let paginated_sql = prepared.sql;
+        let pool = self.pool.clone();
+
+        let (tx, stream) = sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
+            sqlx_common::drive_sqlx_stream_arrow(
+                tx,
+                row_stream,
+                total_rows,
+                chunk_size,
+                start,
+                |row: &sqlx::postgres::PgRow| {
+                    use sqlx::{Column, TypeInfo};
+                    row.columns()
+                        .iter()
+                        .map(|col| {
+                            let oid = pg_type_name_to_oid(col.type_info().name());
+                            ColumnInfo {
+                                name: col.name().to_string(),
+                                col_type: map_redshift_type_code(oid),
+                            }
+                        })
+                        .collect()
+                },
+                |row: &sqlx::postgres::PgRow,
+                 columns: &[ColumnInfo],
+                 builder: &mut crate::arrow_builder::ArrowResultBuilder| {
+                    redshift_row_to_arrow(row, columns, builder);
+                },
+            )
+            .await;
+        });
+
+        Ok(stream)
+    }
+
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
         let explain_sql = format!("EXPLAIN {sql}");
 
