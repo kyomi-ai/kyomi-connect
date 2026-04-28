@@ -708,7 +708,10 @@ mod tests {
         use base64::Engine;
         let bytes = vec![0x01, 0x02, 0x03];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let raw = format!(r#"{{"event":"batch","ipc_bytes":"{}","chunk_index":0}}"#, b64);
+        let raw = format!(
+            r#"{{"event":"batch","ipc_bytes":"{}","chunk_index":0}}"#,
+            b64
+        );
         let event: ArrowStreamEvent = serde_json::from_str(&raw).expect("deserialize");
         match event {
             ArrowStreamEvent::Batch {

@@ -12,7 +12,9 @@
 //!   (e.g., the existing non-streaming API endpoints).
 
 use futures_util::StreamExt;
-use kyomi_connect_protocol::{ArrowStream, ArrowStreamEvent, ColumnInfo, QueryStream, QueryStreamEvent};
+use kyomi_connect_protocol::{
+    ArrowStream, ArrowStreamEvent, ColumnInfo, QueryStream, QueryStreamEvent,
+};
 
 use crate::provider::{QueryResult, QueryStatus};
 
@@ -102,19 +104,18 @@ pub fn query_result_to_arrow_stream(
         Some(batch) => {
             let total_rows_returned = batch.num_rows() as u64;
 
-            let schema_ipc =
-                crate::arrow_builder::schema_to_ipc_bytes(batch.schema_ref()).map_err(|e| {
+            let schema_ipc = crate::arrow_builder::schema_to_ipc_bytes(batch.schema_ref())
+                .map_err(|e| {
                     kyomi_connect_protocol::Error::Internal(format!(
                         "Arrow schema serialization error: {e}"
                     ))
                 })?;
 
-            let ipc_bytes =
-                crate::arrow_builder::batch_to_ipc_bytes(&batch).map_err(|e| {
-                    kyomi_connect_protocol::Error::Internal(format!(
-                        "Arrow batch serialization error: {e}"
-                    ))
-                })?;
+            let ipc_bytes = crate::arrow_builder::batch_to_ipc_bytes(&batch).map_err(|e| {
+                kyomi_connect_protocol::Error::Internal(format!(
+                    "Arrow batch serialization error: {e}"
+                ))
+            })?;
 
             let schema_event = ArrowStreamEvent::Schema {
                 schema_ipc,
@@ -145,14 +146,12 @@ pub fn query_result_to_arrow_stream(
         None => {
             // No record batch (e.g., DDL statement): emit empty Schema + Complete.
             let empty_builder = crate::arrow_builder::ArrowResultBuilder::new(&columns);
-            let schema_ipc =
-                crate::arrow_builder::schema_to_ipc_bytes(empty_builder.schema()).map_err(
-                    |e| {
-                        kyomi_connect_protocol::Error::Internal(format!(
-                            "Arrow schema serialization error: {e}"
-                        ))
-                    },
-                )?;
+            let schema_ipc = crate::arrow_builder::schema_to_ipc_bytes(empty_builder.schema())
+                .map_err(|e| {
+                    kyomi_connect_protocol::Error::Internal(format!(
+                        "Arrow schema serialization error: {e}"
+                    ))
+                })?;
 
             let schema_event = ArrowStreamEvent::Schema {
                 schema_ipc,
@@ -167,8 +166,7 @@ pub fn query_result_to_arrow_stream(
                 total_rows_returned: 0,
             };
 
-            let stream =
-                futures_util::stream::iter(vec![Ok(schema_event), Ok(complete_event)]);
+            let stream = futures_util::stream::iter(vec![Ok(schema_event), Ok(complete_event)]);
 
             Ok(Box::pin(stream))
         }

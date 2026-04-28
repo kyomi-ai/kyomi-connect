@@ -305,10 +305,13 @@ impl DatasourceProvider for PostgresProvider {
         }
 
         let record_batch = arrow_builder.and_then(|builder| {
-            builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "PostgreSQL Arrow batch construction failed");
-                e
-            }).ok()
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "PostgreSQL Arrow batch construction failed");
+                    e
+                })
+                .ok()
         });
 
         let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
@@ -493,10 +496,8 @@ impl DatasourceProvider for PostgresProvider {
             .await
         {
             Ok(result) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -519,10 +520,8 @@ impl DatasourceProvider for PostgresProvider {
             .await
         {
             Ok(result) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -820,9 +819,7 @@ pub(crate) fn pg_row_to_arrow(
                     builder.append_f64(idx, v as f64);
                 } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
                     builder.append_f64(idx, v);
-                } else if let Ok(Some(v)) =
-                    row.try_get::<Option<rust_decimal::Decimal>, _>(idx)
-                {
+                } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                     if let Ok(f) = v.to_string().parse::<f64>() {
                         builder.append_f64(idx, f);
                     } else {
@@ -871,9 +868,7 @@ pub(crate) fn pg_row_to_arrow(
                 }
             }
             SimpleType::TimestampTz => {
-                if let Ok(Some(v)) =
-                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
-                {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx) {
                     builder.append_datetime_utc(idx, v);
                 } else {
                     builder.append_null(idx);

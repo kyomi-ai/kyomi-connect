@@ -446,10 +446,13 @@ impl DatasourceProvider for ClickHouseProvider {
         }
 
         let record_batch = arrow_builder.and_then(|builder| {
-            builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "ClickHouse Arrow batch construction failed");
-                e
-            }).ok()
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "ClickHouse Arrow batch construction failed");
+                    e
+                })
+                .ok()
         });
 
         let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
@@ -512,10 +515,8 @@ impl DatasourceProvider for ClickHouseProvider {
             .await
         {
             Ok(result) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -1331,10 +1332,13 @@ mod tests {
     // --- clickhouse_row_to_arrow ---
 
     use crate::arrow_builder::ArrowResultBuilder;
-    use arrow::array::{Array, Float64Array, TimestampMicrosecondArray, Date32Array};
+    use arrow::array::{Array, Date32Array, Float64Array, TimestampMicrosecondArray};
 
     fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
     }
 
     /// Convenience: build a one-row Arrow batch from a single-column ClickHouse row.
@@ -1404,13 +1408,13 @@ mod tests {
 
     #[test]
     fn ch_date_value_not_null() {
-        let batch = ch_row_to_batch(
-            Value::String("2026-01-15".into()),
-            SimpleType::Date,
-            true,
-        );
+        let batch = ch_row_to_batch(Value::String("2026-01-15".into()), SimpleType::Date, true);
         assert!(!batch.column(0).is_null(0), "Date value must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
@@ -1421,13 +1425,16 @@ mod tests {
 
     #[test]
     fn ch_number_as_string_not_null() {
-        let batch = ch_row_to_batch(
-            Value::String("42".into()),
-            SimpleType::Number,
-            true,
+        let batch = ch_row_to_batch(Value::String("42".into()), SimpleType::Number, true);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Number-as-string must not be null"
         );
-        assert!(!batch.column(0).is_null(0), "Number-as-string must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
     }
 

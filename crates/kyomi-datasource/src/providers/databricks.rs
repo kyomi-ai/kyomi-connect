@@ -506,10 +506,13 @@ impl DatasourceProvider for DatabricksProvider {
         }
 
         let record_batch = arrow_builder.and_then(|builder| {
-            builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "Databricks Arrow batch construction failed");
-                e
-            }).ok()
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Databricks Arrow batch construction failed");
+                    e
+                })
+                .ok()
         });
 
         let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
@@ -545,21 +548,16 @@ impl DatasourceProvider for DatabricksProvider {
     async fn list_catalogs(&self) -> crate::provider::DiscoveryResult {
         match self.execute_query("SHOW CATALOGS", None, None, false).await {
             Ok(result) => {
-                let mut items: Vec<String> = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                )
-                .into_iter()
-                .filter(|name| {
-                    let lower = name.to_lowercase();
-                    lower != "system" && lower != "hive_metastore"
-                })
-                .collect();
+                let mut items: Vec<String> =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0)
+                        .into_iter()
+                        .filter(|name| {
+                            let lower = name.to_lowercase();
+                            lower != "system" && lower != "hive_metastore"
+                        })
+                        .collect();
                 items.sort();
-                crate::provider::DiscoveryResult {
-                    items,
-                    error: None,
-                }
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -1004,11 +1002,16 @@ mod tests {
     // --- databricks_row_to_arrow ---
 
     use crate::arrow_builder::ArrowResultBuilder;
-    use arrow::array::{Array, Float64Array, StringArray, TimestampMicrosecondArray, Date32Array, BooleanArray};
     use crate::provider::{ColumnInfo, SimpleType};
+    use arrow::array::{
+        Array, BooleanArray, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray,
+    };
 
     fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
     }
 
     fn db_row_to_batch(
@@ -1024,8 +1027,15 @@ mod tests {
     #[test]
     fn db_number_as_string_not_null() {
         let batch = db_row_to_batch(vec![serde_json::json!("42")], SimpleType::Number);
-        assert!(!batch.column(0).is_null(0), "Databricks number-as-string must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks number-as-string must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
     }
 
@@ -1036,8 +1046,15 @@ mod tests {
             vec![serde_json::json!("2026-01-15 14:30:00")],
             SimpleType::Timestamp,
         );
-        assert!(!batch.column(0).is_null(0), "Databricks timestamp must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks timestamp must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
             .and_hms_opt(14, 30, 0)
@@ -1049,12 +1066,16 @@ mod tests {
 
     #[test]
     fn db_date_string_not_null() {
-        let batch = db_row_to_batch(
-            vec![serde_json::json!("2026-01-15")],
-            SimpleType::Date,
+        let batch = db_row_to_batch(vec![serde_json::json!("2026-01-15")], SimpleType::Date);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks date must not be null"
         );
-        assert!(!batch.column(0).is_null(0), "Databricks date must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
@@ -1070,7 +1091,11 @@ mod tests {
             SimpleType::String,
         );
         assert!(!batch.column(0).is_null(0));
-        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(arr.value(0), "hello databricks");
     }
 
@@ -1078,7 +1103,11 @@ mod tests {
     fn db_boolean_string_not_null() {
         let batch = db_row_to_batch(vec![serde_json::json!("true")], SimpleType::Boolean);
         assert!(!batch.column(0).is_null(0));
-        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(arr.value(0));
     }
 
@@ -1108,7 +1137,11 @@ mod tests {
         assert!(!batch.column(1).is_null(0), "n must not be null");
         assert!(batch.column(2).is_null(0), "null s must be null");
 
-        let arr_n = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let arr_n = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((arr_n.value(0) - 77.0).abs() < f64::EPSILON);
     }
 

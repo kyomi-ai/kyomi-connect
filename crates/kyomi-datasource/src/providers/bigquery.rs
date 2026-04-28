@@ -633,10 +633,13 @@ impl DatasourceProvider for BigQueryProvider {
         }
 
         let record_batch = arrow_builder.and_then(|builder| {
-            builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "BigQuery Arrow batch construction failed");
-                e
-            }).ok()
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "BigQuery Arrow batch construction failed");
+                    e
+                })
+                .ok()
         });
 
         // Extract total rows from the query response (available at zero cost
@@ -1184,9 +1187,7 @@ pub(crate) fn bigquery_row_to_arrow(
     columns: &[crate::provider::ColumnInfo],
     builder: &mut crate::arrow_builder::ArrowResultBuilder,
 ) {
-    let cells = bq_row
-        .get("f")
-        .and_then(|f| f.as_array());
+    let cells = bq_row.get("f").and_then(|f| f.as_array());
 
     for (idx, col) in columns.iter().enumerate() {
         let value = cells
@@ -1383,19 +1384,20 @@ mod tests {
     // --- bigquery_row_to_arrow ---
 
     use crate::arrow_builder::ArrowResultBuilder;
-    use arrow::array::{Array, Float64Array, StringArray, TimestampMicrosecondArray, Date32Array};
     use crate::provider::{ColumnInfo, SimpleType};
+    use arrow::array::{Array, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray};
 
     fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
-        ColumnInfo { name: name.to_string(), col_type }
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
     }
 
     /// Build a BigQuery-format row value: `{"f": [{"v": ...}, ...]}`
     fn bq_row(values: &[serde_json::Value]) -> serde_json::Value {
-        let cells: Vec<serde_json::Value> = values
-            .iter()
-            .map(|v| serde_json::json!({"v": v}))
-            .collect();
+        let cells: Vec<serde_json::Value> =
+            values.iter().map(|v| serde_json::json!({"v": v})).collect();
         serde_json::json!({"f": cells})
     }
 
@@ -1411,7 +1413,11 @@ mod tests {
             !batch.column(0).is_null(0),
             "BigQuery DATETIME string must not be null"
         );
-        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
             .and_hms_opt(14, 30, 0)
@@ -1428,8 +1434,15 @@ mod tests {
         let row = bq_row(&[serde_json::json!("42")]);
         bigquery_row_to_arrow(&row, &columns, &mut builder);
         let batch = builder.finish().unwrap();
-        assert!(!batch.column(0).is_null(0), "BigQuery number-as-string must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(
+            !batch.column(0).is_null(0),
+            "BigQuery number-as-string must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
     }
 
@@ -1451,7 +1464,11 @@ mod tests {
         bigquery_row_to_arrow(&row, &columns, &mut builder);
         let batch = builder.finish().unwrap();
         assert!(!batch.column(0).is_null(0));
-        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(arr.value(0), "hello");
     }
 
@@ -1476,7 +1493,11 @@ mod tests {
         assert!(!batch.column(1).is_null(0), "n must not be null");
         assert!(batch.column(2).is_null(0), "s (null) must be null");
 
-        let arr_n = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let arr_n = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((arr_n.value(0) - 42.0).abs() < f64::EPSILON);
     }
 
@@ -1487,8 +1508,15 @@ mod tests {
         let row = bq_row(&[serde_json::json!("2026-01-15")]);
         bigquery_row_to_arrow(&row, &columns, &mut builder);
         let batch = builder.finish().unwrap();
-        assert!(!batch.column(0).is_null(0), "BigQuery Date must not be null");
-        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        assert!(
+            !batch.column(0).is_null(0),
+            "BigQuery Date must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()

@@ -354,9 +354,7 @@ fn tds_row_to_arrow_at(
                 builder.append_i64(col_idx, v as i64);
             } else if let Ok(Some(v)) = row.try_get::<f32, _>(row_idx) {
                 builder.append_f64(col_idx, v as f64);
-            } else if let Ok(Some(v)) =
-                row.try_get::<tiberius::numeric::Numeric, _>(row_idx)
-            {
+            } else if let Ok(Some(v)) = row.try_get::<tiberius::numeric::Numeric, _>(row_idx) {
                 let s = format!("{v}");
                 if let Ok(f) = s.parse::<f64>() {
                     builder.append_f64(col_idx, f);
@@ -569,7 +567,9 @@ pub(crate) async fn execute_tds_query(
     // We use `actual_idx` to address the tiberius row and `i` to address the
     // filtered column / Arrow builder slot.
     let mut arrow_builder = if !filtered_columns.is_empty() {
-        Some(crate::arrow_builder::ArrowResultBuilder::new(&filtered_columns))
+        Some(crate::arrow_builder::ArrowResultBuilder::new(
+            &filtered_columns,
+        ))
     } else {
         None
     };

@@ -296,10 +296,13 @@ impl DatasourceProvider for MySqlProvider {
         }
 
         let record_batch = arrow_builder.and_then(|builder| {
-            builder.finish().map_err(|e| {
-                tracing::warn!(error = %e, "MySQL Arrow batch construction failed");
-                e
-            }).ok()
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "MySQL Arrow batch construction failed");
+                    e
+                })
+                .ok()
         });
 
         let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
@@ -676,9 +679,7 @@ pub(crate) fn mysql_row_to_arrow(
                     builder.append_f64(idx, v as f64);
                 } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
                     builder.append_f64(idx, v);
-                } else if let Ok(Some(v)) =
-                    row.try_get::<Option<rust_decimal::Decimal>, _>(idx)
-                {
+                } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                     if let Ok(f) = v.to_string().parse::<f64>() {
                         builder.append_f64(idx, f);
                     } else {

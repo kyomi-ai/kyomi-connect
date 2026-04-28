@@ -398,18 +398,17 @@ pub(crate) async fn drive_sqlx_stream_arrow<R, S, FC, FR>(
                     columns_ready = true;
 
                     let arrow_builder = ArrowResultBuilder::new(&columns);
-                    let schema_ipc =
-                        match schema_to_ipc_bytes(arrow_builder.schema()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(Error::Internal(format!(
-                                        "Arrow schema serialization error: {e}"
-                                    ))))
-                                    .await;
-                                return;
-                            }
-                        };
+                    let schema_ipc = match schema_to_ipc_bytes(arrow_builder.schema()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
 
                     if tx
                         .send(Ok(ArrowStreamEvent::Schema {
@@ -427,7 +426,9 @@ pub(crate) async fn drive_sqlx_stream_arrow<R, S, FC, FR>(
                 }
 
                 // Convert row to Arrow values
-                let b = builder.as_mut().expect("builder initialized with first row");
+                let b = builder
+                    .as_mut()
+                    .expect("builder initialized with first row");
                 convert_row_arrow(&row, &columns, b);
                 total_rows_returned += 1;
 
@@ -464,18 +465,17 @@ pub(crate) async fn drive_sqlx_stream_arrow<R, S, FC, FR>(
                 // Stream exhausted -- emit schema if we never got any rows
                 if !columns_ready {
                     let empty_builder = ArrowResultBuilder::new(&[]);
-                    let schema_ipc =
-                        match schema_to_ipc_bytes(empty_builder.schema()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(Error::Internal(format!(
-                                        "Arrow schema serialization error: {e}"
-                                    ))))
-                                    .await;
-                                return;
-                            }
-                        };
+                    let schema_ipc = match schema_to_ipc_bytes(empty_builder.schema()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
 
                     if tx
                         .send(Ok(ArrowStreamEvent::Schema {

@@ -1176,7 +1176,9 @@ mod tests {
         assert_eq!(json["id"], "ah-1");
         assert_eq!(json["type"], "arrow_header");
         // schema_ipc is base64-encoded
-        let encoded = json["schema_ipc"].as_str().expect("schema_ipc should be a string");
+        let encoded = json["schema_ipc"]
+            .as_str()
+            .expect("schema_ipc should be a string");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .expect("valid base64");
@@ -1216,7 +1218,9 @@ mod tests {
         assert_eq!(json["id"], "ab-1");
         assert_eq!(json["type"], "arrow_batch");
         assert_eq!(json["chunk_index"], 2);
-        let encoded = json["ipc_bytes"].as_str().expect("ipc_bytes should be a string");
+        let encoded = json["ipc_bytes"]
+            .as_str()
+            .expect("ipc_bytes should be a string");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .expect("valid base64");

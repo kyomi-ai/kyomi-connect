@@ -332,10 +332,8 @@ impl DatasourceProvider for SqlServerProvider {
             .await
         {
             Ok(result) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -362,10 +360,8 @@ impl DatasourceProvider for SqlServerProvider {
             .await
         {
             Ok(result) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    result.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
