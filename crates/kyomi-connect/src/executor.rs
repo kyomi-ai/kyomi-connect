@@ -144,14 +144,13 @@ impl CommandExecutor {
             // When Arrow format is requested and the provider populated record_batch,
             // return three Arrow IPC messages: ArrowHeader → ArrowBatch → ArrowComplete.
             // If record_batch is None (provider didn't populate it), fall through to JSON.
-            if params.format == QueryFormat::Arrow && result.record_batch.is_some() {
-                // Destructure to extract the batch while keeping other fields accessible.
+            if params.format == QueryFormat::Arrow
+                && let Some(batch) = result.record_batch
+            {
                 let columns = result.columns.unwrap_or_default();
                 let total_rows = result.total_rows;
                 let execution_time_ms = result.execution_time_ms;
                 let bytes_processed = result.bytes_processed;
-                // Safe: we checked is_some() above.
-                let batch = result.record_batch.unwrap();
                 let row_count = batch.num_rows() as u64;
 
                 let schema_ipc = match schema_to_ipc_bytes(batch.schema_ref()) {

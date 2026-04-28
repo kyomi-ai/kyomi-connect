@@ -491,30 +491,28 @@ pub(crate) async fn drive_sqlx_stream_arrow<R, S, FC, FR>(
                 }
 
                 // Flush remaining rows
-                if let Some(remaining) = builder.take() {
-                    if remaining.row_count() > 0 {
-                        match remaining.finish_to_ipc() {
-                            Ok(ipc_bytes) => {
-                                if tx
-                                    .send(Ok(ArrowStreamEvent::Batch {
-                                        ipc_bytes,
-                                        chunk_index,
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                chunk_index += 1;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(Error::Internal(format!(
-                                        "Arrow IPC serialization error: {e}"
-                                    ))))
-                                    .await;
+                if let Some(remaining) = builder.take().filter(|b| b.row_count() > 0) {
+                    match remaining.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
+                            chunk_index += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
                         }
                     }
                 }

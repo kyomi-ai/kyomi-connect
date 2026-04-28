@@ -624,11 +624,11 @@ impl DatasourceProvider for BigQueryProvider {
             None
         };
 
-        if let Some(ref mut builder) = arrow_builder {
-            if let Some(raw_rows) = result.get("rows").and_then(|r| r.as_array()) {
-                for bq_row in raw_rows {
-                    bigquery_row_to_arrow(bq_row, &columns, builder);
-                }
+        if let Some(ref mut builder) = arrow_builder
+            && let Some(raw_rows) = result.get("rows").and_then(|r| r.as_array())
+        {
+            for bq_row in raw_rows {
+                bigquery_row_to_arrow(bq_row, &columns, builder);
             }
         }
 

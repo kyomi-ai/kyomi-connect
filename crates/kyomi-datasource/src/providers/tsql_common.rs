@@ -299,24 +299,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 // Arrow conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a tiberius row directly to Arrow column builders.
-///
-/// This is the Arrow counterpart of [`tds_row_value_to_json`]. Instead of
-/// creating `serde_json::Value` intermediaries, native Rust types go directly
-/// into Arrow column builders, preserving date/time/timestamp precision.
-///
-/// Used by both the SQL Server and Synapse providers.
-pub(crate) fn tds_row_to_arrow(
-    row: &Row,
-    columns: &[ColumnInfo],
-    builder: &mut crate::arrow_builder::ArrowResultBuilder,
-) {
-    for (idx, col) in columns.iter().enumerate() {
-        tds_row_to_arrow_at(row, idx, idx, col.col_type, builder);
-    }
-    builder.finish_row();
-}
-
 /// Append one column value from a tiberius row directly into an Arrow builder.
 ///
 /// Unlike [`tds_row_to_arrow`], this function accepts separate indices:

@@ -980,25 +980,25 @@ pub(crate) fn clickhouse_row_to_arrow(
 
         // ClickHouse-specific: for Timestamp columns, if the server timezone
         // is UTC, treat bare datetime strings as TimestampTz (append Z).
-        if server_tz_is_utc && col.col_type == SimpleType::Timestamp {
-            if let Some(s) = value.as_str() {
-                // Convert "YYYY-MM-DD HH:MM:SS" → ISO 8601 with Z suffix
-                if s.len() >= 19 && s.as_bytes().get(10) == Some(&b' ') {
-                    let mut iso = String::with_capacity(s.len() + 1);
-                    iso.push_str(&s[..10]);
-                    iso.push('T');
-                    iso.push_str(&s[11..]);
-                    iso.push('Z');
-                    let coerced = Value::String(iso);
-                    crate::arrow_builder::json_value_to_arrow(
-                        &coerced,
-                        SimpleType::TimestampTz,
-                        builder,
-                        idx,
-                    );
-                    continue;
-                }
-            }
+        if server_tz_is_utc
+            && col.col_type == SimpleType::Timestamp
+            && let Some(s) = value.as_str()
+            && s.len() >= 19
+            && s.as_bytes().get(10) == Some(&b' ')
+        {
+            let mut iso = String::with_capacity(s.len() + 1);
+            iso.push_str(&s[..10]);
+            iso.push('T');
+            iso.push_str(&s[11..]);
+            iso.push('Z');
+            let coerced = Value::String(iso);
+            crate::arrow_builder::json_value_to_arrow(
+                &coerced,
+                SimpleType::TimestampTz,
+                builder,
+                idx,
+            );
+            continue;
         }
 
         crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
