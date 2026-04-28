@@ -111,13 +111,25 @@ async fn postgres_arrow_timestamps() {
         .unwrap();
 
     let result = provider
-        .execute_query("SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id", Some(10), None, false)
+        .execute_query(
+            "SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id",
+            Some(10),
+            None,
+            false,
+        )
         .await
         .unwrap();
 
-    assert!(result.record_batch.is_some(), "Postgres: record_batch should be populated");
+    assert!(
+        result.record_batch.is_some(),
+        "Postgres: record_batch should be populated"
+    );
     let batch = result.record_batch.unwrap();
-    assert!(batch.num_rows() >= 3, "Expected at least 3 rows, got {}", batch.num_rows());
+    assert!(
+        batch.num_rows() >= 3,
+        "Expected at least 3 rows, got {}",
+        batch.num_rows()
+    );
 
     // Verify Arrow types
     assert_batch_has_timestamps(&batch, "ts");
@@ -126,14 +138,25 @@ async fn postgres_arrow_timestamps() {
     // Verify the batch has no null timestamps
     let ts_col = batch.column(1);
     for i in 0..batch.num_rows() {
-        assert!(!ts_col.is_null(i), "Postgres: ts column row {i} should not be null");
+        assert!(
+            !ts_col.is_null(i),
+            "Postgres: ts column row {i} should not be null"
+        );
     }
 
     // Verify rows is None (not populated in Arrow-only mode)
-    assert!(result.rows.is_none(), "Postgres: rows should be None in Arrow-only mode");
+    assert!(
+        result.rows.is_none(),
+        "Postgres: rows should be None in Arrow-only mode"
+    );
 
     provider.close().await;
-    println!("Postgres: ✅ timestamps={}, dates={}, rows={}", batch.num_rows(), batch.num_columns(), batch.num_rows());
+    println!(
+        "Postgres: ✅ timestamps={}, dates={}, rows={}",
+        batch.num_rows(),
+        batch.num_columns(),
+        batch.num_rows()
+    );
 }
 
 // =============================================================================
@@ -182,11 +205,19 @@ async fn mysql_arrow_timestamps() {
         .unwrap();
 
     let result = provider
-        .execute_query("SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id", Some(10), None, false)
+        .execute_query(
+            "SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id",
+            Some(10),
+            None,
+            false,
+        )
         .await
         .unwrap();
 
-    assert!(result.record_batch.is_some(), "MySQL: record_batch should be populated");
+    assert!(
+        result.record_batch.is_some(),
+        "MySQL: record_batch should be populated"
+    );
     let batch = result.record_batch.unwrap();
     assert!(batch.num_rows() >= 3);
 
@@ -234,16 +265,29 @@ async fn clickhouse_arrow_timestamps() {
         .unwrap();
 
     let _ = provider
-        .execute_query("INSERT INTO arrow_test (id) VALUES (1), (2), (3)", None, None, false)
+        .execute_query(
+            "INSERT INTO arrow_test (id) VALUES (1), (2), (3)",
+            None,
+            None,
+            false,
+        )
         .await
         .unwrap();
 
     let result = provider
-        .execute_query("SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id", Some(10), None, false)
+        .execute_query(
+            "SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id",
+            Some(10),
+            None,
+            false,
+        )
         .await
         .unwrap();
 
-    assert!(result.record_batch.is_some(), "ClickHouse: record_batch should be populated");
+    assert!(
+        result.record_batch.is_some(),
+        "ClickHouse: record_batch should be populated"
+    );
     let batch = result.record_batch.unwrap();
     assert!(batch.num_rows() >= 3);
 
@@ -254,13 +298,19 @@ async fn clickhouse_arrow_timestamps() {
     // Critical: verify timestamps are NOT null (this was the bug we fixed)
     let ts_col = batch.column(1);
     for i in 0..batch.num_rows() {
-        assert!(!ts_col.is_null(i), "ClickHouse: ts column row {i} should NOT be null (this was the DateTime null bug)");
+        assert!(
+            !ts_col.is_null(i),
+            "ClickHouse: ts column row {i} should NOT be null (this was the DateTime null bug)"
+        );
     }
 
     assert!(result.rows.is_none(), "ClickHouse: rows should be None");
 
     provider.close().await;
-    println!("ClickHouse: ✅ timestamps correct (non-null), {} rows", batch.num_rows());
+    println!(
+        "ClickHouse: ✅ timestamps correct (non-null), {} rows",
+        batch.num_rows()
+    );
 }
 
 // =============================================================================
@@ -316,11 +366,19 @@ async fn sqlserver_arrow_timestamps() {
         .unwrap();
 
     let result = provider
-        .execute_query("SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id", Some(10), None, false)
+        .execute_query(
+            "SELECT id, ts, dt, val, name FROM arrow_test ORDER BY id",
+            Some(10),
+            None,
+            false,
+        )
         .await
         .unwrap();
 
-    assert!(result.record_batch.is_some(), "SQL Server: record_batch should be populated");
+    assert!(
+        result.record_batch.is_some(),
+        "SQL Server: record_batch should be populated"
+    );
     let batch = result.record_batch.unwrap();
     assert!(batch.num_rows() >= 3);
 
@@ -329,5 +387,8 @@ async fn sqlserver_arrow_timestamps() {
     assert!(result.rows.is_none(), "SQL Server: rows should be None");
 
     provider.close().await;
-    println!("SQL Server: ✅ timestamps correct, {} rows", batch.num_rows());
+    println!(
+        "SQL Server: ✅ timestamps correct, {} rows",
+        batch.num_rows()
+    );
 }
