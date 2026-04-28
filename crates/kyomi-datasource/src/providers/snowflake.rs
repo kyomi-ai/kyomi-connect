@@ -1493,6 +1493,122 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
         );
     }
 
+    // --- snowflake_row_to_arrow ---
+
+    use crate::arrow_builder::ArrowResultBuilder;
+    use arrow::array::{Array, Float64Array, StringArray, TimestampMicrosecondArray, Date32Array, BooleanArray};
+    use crate::provider::{ColumnInfo, SimpleType};
+
+    fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), col_type }
+    }
+
+    fn sf_row_to_batch(
+        values: Vec<serde_json::Value>,
+        col_type: SimpleType,
+    ) -> arrow::record_batch::RecordBatch {
+        let columns = vec![make_col("col", col_type)];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        snowflake_row_to_arrow(&values, &columns, &mut builder);
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn sf_number_as_string_not_null() {
+        let batch = sf_row_to_batch(vec![serde_json::json!("42")], SimpleType::Number);
+        assert!(!batch.column(0).is_null(0), "Snowflake number-as-string must not be null");
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sf_timestamp_epoch_string_not_null() {
+        // Snowflake TIMESTAMP_NTZ returns epoch seconds as a string
+        let epoch_secs = 1_737_000_000.0_f64;
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!(epoch_secs.to_string())],
+            SimpleType::Timestamp,
+        );
+        assert!(!batch.column(0).is_null(0), "Snowflake epoch timestamp must not be null");
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected = (epoch_secs * 1_000_000.0) as i64;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn sf_timestamp_iso_string_not_null() {
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!("2026-01-15T14:30:00")],
+            SimpleType::Timestamp,
+        );
+        assert!(!batch.column(0).is_null(0), "Snowflake ISO timestamp must not be null");
+    }
+
+    #[test]
+    fn sf_date_string_not_null() {
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!("2026-01-15")],
+            SimpleType::Date,
+        );
+        assert!(!batch.column(0).is_null(0), "Snowflake date must not be null");
+        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn sf_string_value_not_null() {
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!("hello snowflake")],
+            SimpleType::String,
+        );
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "hello snowflake");
+    }
+
+    #[test]
+    fn sf_boolean_true_not_null() {
+        let batch = sf_row_to_batch(vec![serde_json::json!("1")], SimpleType::Boolean);
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn sf_null_value_is_null() {
+        let batch = sf_row_to_batch(vec![serde_json::Value::Null], SimpleType::Number);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn sf_multi_column_row() {
+        let columns = vec![
+            make_col("ts", SimpleType::Timestamp),
+            make_col("n", SimpleType::Number),
+            make_col("s", SimpleType::String),
+        ];
+        let row = vec![
+            serde_json::json!("2026-01-15T14:30:00"),
+            serde_json::json!("99"),
+            serde_json::Value::Null,
+        ];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        snowflake_row_to_arrow(&row, &columns, &mut builder);
+        let batch = builder.finish().unwrap();
+
+        assert!(!batch.column(0).is_null(0), "ts must not be null");
+        assert!(!batch.column(1).is_null(0), "n must not be null");
+        assert!(batch.column(2).is_null(0), "null s must be null");
+
+        let arr_n = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr_n.value(0) - 99.0).abs() < f64::EPSILON);
+    }
+
     // --- Helper: Pad base64url to standard base64 for decoding ---
 
     fn pad_base64url(input: &str) -> String {

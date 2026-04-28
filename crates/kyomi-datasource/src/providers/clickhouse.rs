@@ -1328,6 +1328,129 @@ mod tests {
         assert_eq!(col, Some(25));
     }
 
+    // --- clickhouse_row_to_arrow ---
+
+    use crate::arrow_builder::ArrowResultBuilder;
+    use arrow::array::{Array, Float64Array, TimestampMicrosecondArray, Date32Array};
+
+    fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), col_type }
+    }
+
+    /// Convenience: build a one-row Arrow batch from a single-column ClickHouse row.
+    fn ch_row_to_batch(
+        value: Value,
+        col_type: SimpleType,
+        server_tz_is_utc: bool,
+    ) -> arrow::record_batch::RecordBatch {
+        let columns = vec![make_col("col", col_type)];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        clickhouse_row_to_arrow(&[value], &columns, &mut builder, server_tz_is_utc);
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn ch_datetime_utc_server_not_null() {
+        // "2026-01-15 14:30:00" with server_tz_is_utc=true → must not be null
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00".into()),
+            SimpleType::Timestamp,
+            true,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime with UTC server must produce a non-null TimestampTz value"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        // 2026-01-15 14:30:00 UTC in microseconds
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_datetime_non_utc_server_not_null() {
+        // "2026-01-15 14:30:00" with server_tz_is_utc=false → Timestamp (no Z), not null
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00".into()),
+            SimpleType::Timestamp,
+            false,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime with non-UTC server must also produce a non-null Timestamp value"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_date_value_not_null() {
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15".into()),
+            SimpleType::Date,
+            true,
+        );
+        assert!(!batch.column(0).is_null(0), "Date value must not be null");
+        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_number_as_string_not_null() {
+        let batch = ch_row_to_batch(
+            Value::String("42".into()),
+            SimpleType::Number,
+            true,
+        );
+        assert!(!batch.column(0).is_null(0), "Number-as-string must not be null");
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ch_null_value_is_null() {
+        let batch = ch_row_to_batch(Value::Null, SimpleType::Number, true);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn ch_datetime_with_subseconds_utc_not_null() {
+        // DateTime64(3) returns subsecond precision: "2026-01-15 14:30:00.123"
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00.123".into()),
+            SimpleType::Timestamp,
+            true,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime64 with subseconds must not be null"
+        );
+    }
+
     // --- URL encoding ---
 
     #[test]

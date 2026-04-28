@@ -431,6 +431,10 @@ pub fn json_value_to_arrow(
                     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
                 {
                     builder.append_naive_datetime(col_idx, dt);
+                // RFC3339 with timezone suffix (e.g. "2026-01-15T14:30:00Z" produced by
+                // the ClickHouse coercion path). Strip the timezone and treat as naive.
+                } else if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                    builder.append_naive_datetime(col_idx, dt.naive_utc());
                 // Epoch-second strings (Snowflake returns timestamps this way)
                 } else if let Ok(f) = s.parse::<f64>() {
                     let micros = (f * 1_000_000.0) as i64;
@@ -979,6 +983,285 @@ mod tests {
         let batch = builder.finish().unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 1);
+    }
+
+    // -- json_value_to_arrow: Number ------------------------------------------
+
+    fn single_col(st: SimpleType) -> Vec<ColumnInfo> {
+        make_columns(&[("val", st)])
+    }
+
+    fn finish_one(st: SimpleType, value: &serde_json::Value) -> arrow::record_batch::RecordBatch {
+        let columns = single_col(st);
+        let mut builder = ArrowResultBuilder::new(&columns);
+        json_value_to_arrow(value, st, &mut builder, 0);
+        builder.finish_row();
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn jva_number_json_integer() {
+        let batch = finish_one(SimpleType::Number, &serde_json::json!(42));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn jva_number_json_float() {
+        let batch = finish_one(SimpleType::Number, &serde_json::json!(3.14));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn jva_number_string_integer() {
+        let batch = finish_one(SimpleType::Number, &serde_json::json!("123"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 123.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn jva_number_string_float() {
+        let batch = finish_one(SimpleType::Number, &serde_json::json!("9.99"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((arr.value(0) - 9.99).abs() < 1e-10);
+    }
+
+    #[test]
+    fn jva_number_null() {
+        let batch = finish_one(SimpleType::Number, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: Boolean -----------------------------------------
+
+    #[test]
+    fn jva_boolean_true() {
+        let batch = finish_one(SimpleType::Boolean, &serde_json::json!(true));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn jva_boolean_false() {
+        let batch = finish_one(SimpleType::Boolean, &serde_json::json!(false));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!arr.value(0));
+    }
+
+    #[test]
+    fn jva_boolean_string_one() {
+        let batch = finish_one(SimpleType::Boolean, &serde_json::json!("1"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn jva_boolean_string_true() {
+        let batch = finish_one(SimpleType::Boolean, &serde_json::json!("true"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn jva_boolean_null() {
+        let batch = finish_one(SimpleType::Boolean, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: String ------------------------------------------
+
+    #[test]
+    fn jva_string_plain() {
+        let batch = finish_one(SimpleType::String, &serde_json::json!("hello world"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "hello world");
+    }
+
+    #[test]
+    fn jva_string_null() {
+        let batch = finish_one(SimpleType::String, &serde_json::Value::Null);
+        // Null JSON → null cell (append_null)
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: Date --------------------------------------------
+
+    #[test]
+    fn jva_date_valid() {
+        let batch = finish_one(SimpleType::Date, &serde_json::json!("2026-01-15"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_date_null() {
+        let batch = finish_one(SimpleType::Date, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn jva_date_malformed_falls_back_to_string() {
+        // Malformed date falls back to append_string, but the builder is Date32
+        // so append_string → append_null on the Date32 builder.
+        let batch = finish_one(SimpleType::Date, &serde_json::json!("not-a-date"));
+        // The Date branch calls append_string as fallback, which on a Date32
+        // builder hits the `other => other.append_null()` arm.
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: Timestamp ---------------------------------------
+
+    #[test]
+    fn jva_timestamp_iso_t_format() {
+        let batch = finish_one(SimpleType::Timestamp, &serde_json::json!("2026-01-15T14:30:00"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_timestamp_space_format() {
+        let batch = finish_one(SimpleType::Timestamp, &serde_json::json!("2026-01-15 14:30:00"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_timestamp_with_subseconds() {
+        let batch = finish_one(
+            SimpleType::Timestamp,
+            &serde_json::json!("2026-01-15T14:30:00.123456"),
+        );
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_micro_opt(14, 30, 0, 123_456)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_timestamp_epoch_seconds_as_string() {
+        // Snowflake returns timestamps as epoch-seconds strings
+        let epoch_secs = 1_737_000_000.0_f64;
+        let value = serde_json::json!(epoch_secs.to_string());
+        let batch = finish_one(SimpleType::Timestamp, &value);
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected = (epoch_secs * 1_000_000.0) as i64;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_timestamp_null() {
+        let batch = finish_one(SimpleType::Timestamp, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    /// Timestamp with Z suffix (produced by ClickHouse coercion path) must not
+    /// result in null. This is the regression test for the known ClickHouse bug.
+    #[test]
+    fn jva_timestamp_with_z_suffix_not_null() {
+        // ClickHouse coerces "2026-01-15 14:30:00" → "2026-01-15T14:30:00Z"
+        // then calls json_value_to_arrow with SimpleType::TimestampTz.
+        // Separately, if Timestamp is used instead the Z suffix must not break parsing.
+        let batch = finish_one(SimpleType::Timestamp, &serde_json::json!("2026-01-15T14:30:00Z"));
+        assert!(!batch.column(0).is_null(0), "Z-suffixed timestamp must not be null for Timestamp type");
+    }
+
+    // -- json_value_to_arrow: TimestampTz -------------------------------------
+
+    #[test]
+    fn jva_timestamptz_rfc3339_z() {
+        let batch = finish_one(SimpleType::TimestampTz, &serde_json::json!("2026-01-15T14:30:00Z"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected: DateTime<Utc> = "2026-01-15T14:30:00Z".parse().unwrap();
+        assert_eq!(arr.value(0), expected.timestamp_micros());
+    }
+
+    #[test]
+    fn jva_timestamptz_rfc3339_offset() {
+        let batch = finish_one(
+            SimpleType::TimestampTz,
+            &serde_json::json!("2026-01-15T14:30:00+00:00"),
+        );
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected: DateTime<Utc> = "2026-01-15T14:30:00Z".parse().unwrap();
+        assert_eq!(arr.value(0), expected.timestamp_micros());
+    }
+
+    #[test]
+    fn jva_timestamptz_null() {
+        let batch = finish_one(SimpleType::TimestampTz, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: Time --------------------------------------------
+
+    #[test]
+    fn jva_time_valid() {
+        let batch = finish_one(SimpleType::Time, &serde_json::json!("14:30:00"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<Time64MicrosecondArray>().unwrap();
+        let expected = 14 * 3600 * 1_000_000i64 + 30 * 60 * 1_000_000;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn jva_time_null() {
+        let batch = finish_one(SimpleType::Time, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    // -- json_value_to_arrow: Unknown -----------------------------------------
+
+    #[test]
+    fn jva_unknown_string_passthrough() {
+        let batch = finish_one(SimpleType::Unknown, &serde_json::json!("some raw value"));
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "some raw value");
+    }
+
+    #[test]
+    fn jva_unknown_null() {
+        // Null JSON → the value.is_null() check fires, append_null is called.
+        let batch = finish_one(SimpleType::Unknown, &serde_json::Value::Null);
+        assert!(batch.column(0).is_null(0));
     }
 
     // -- IPC helper functions -------------------------------------------------
