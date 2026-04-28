@@ -4,5 +4,8 @@ pub mod types;
 pub mod wire;
 
 pub use error::{Error, Result};
-pub use stream::{ColumnInfo, QueryStream, QueryStreamEvent, SimpleType};
+pub use stream::{
+    ArrowStream, ArrowStreamEvent, ColumnInfo, QueryFormat, QueryStream, QueryStreamEvent,
+    SimpleType,
+};
 pub use types::DatasourceType;

@@ -302,13 +302,6 @@ impl DatasourceProvider for ClickHouseProvider {
 
         let prepared = super::sqlx_common::prepare_query(sql, limit, offset);
 
-        // Get total count if requested (only for SELECT/WITH queries)
-        let total_rows = if prepared.is_select && include_total {
-            get_total_count(self, &prepared.sql_stripped).await
-        } else {
-            None
-        };
-
         let paginated_sql = &prepared.sql;
         let effective_limit = limit.unwrap_or(1000);
 
@@ -330,6 +323,7 @@ impl DatasourceProvider for ClickHouseProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
         };
@@ -361,6 +355,7 @@ impl DatasourceProvider for ClickHouseProvider {
                 bytes_processed: None,
                 execution_time_ms: Some(start.elapsed().as_millis() as i64),
                 error: Some(body),
+                record_batch: None,
             });
         }
 
@@ -377,6 +372,7 @@ impl DatasourceProvider for ClickHouseProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(format!("Failed to parse ClickHouse response: {e}")),
+                    record_batch: None,
                 });
             }
         };
@@ -436,18 +432,54 @@ impl DatasourceProvider for ClickHouseProvider {
             })
             .unwrap_or_default();
 
-        let has_more = rows.len() == effective_limit as usize;
+        // Build Arrow RecordBatch from the coerced JSON rows (sole data path).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            for row in &rows {
+                clickhouse_row_to_arrow(row, &columns, builder, self.server_tz_is_utc);
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "ClickHouse Arrow batch construction failed");
+                    e
+                })
+                .ok()
+        });
+
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
+
+        // ClickHouse includes `rows_before_limit_at_least` in the response
+        // metadata — the pre-LIMIT total row count at zero extra cost.
+        // No separate COUNT(*) query needed.
+        let total_rows = if include_total {
+            parsed
+                .get("rows_before_limit_at_least")
+                .and_then(|v| v.as_i64())
+        } else {
+            None
+        };
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed,
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 
@@ -483,13 +515,8 @@ impl DatasourceProvider for ClickHouseProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -843,6 +870,12 @@ fn urlencoded(s: &str) -> String {
 ///
 /// Wraps the query in `SELECT COUNT(*) FROM (...) AS _count_subquery`.
 /// Returns `None` silently on failure.
+/// Get the total row count for a query via a separate COUNT(*) query.
+///
+/// Only used by the streaming path (`execute_query_stream`) which uses
+/// `JSONCompactEachRowWithNamesAndTypes` format that doesn't include
+/// `rows_before_limit_at_least`. The non-streaming `execute_query` path
+/// gets the count for free from the JSONCompact response metadata.
 async fn get_total_count(provider: &ClickHouseProvider, sql: &str) -> Option<i64> {
     let count_sql = format!("SELECT COUNT(*) FROM ({sql}) AS _count_subquery");
 
@@ -866,7 +899,6 @@ async fn get_total_count(provider: &ClickHouseProvider, sql: &str) -> Option<i64
         .and_then(|row| row.as_array())
         .and_then(|cols| cols.first())
         .and_then(|v| {
-            // Count may come as number or string
             v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
         })
@@ -928,6 +960,50 @@ fn coerce_value_type(value: &Value, col: Option<&ColumnInfo>, server_tz_is_utc: 
         // Already the right type, or no coercion needed
         _ => value.clone(),
     }
+}
+
+/// Convert a ClickHouse JSON row directly to Arrow column builders.
+///
+/// ClickHouse data arrives as JSON arrays from the HTTP API (JSONCompact format).
+/// Each element in `row` corresponds to a column. Uses [`SimpleType`] from
+/// `columns` to guide type-aware conversion via the shared
+/// [`crate::arrow_builder::json_value_to_arrow`], with ClickHouse-specific
+/// handling for server timezone annotation on timestamps.
+pub(crate) fn clickhouse_row_to_arrow(
+    row: &[Value],
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+    server_tz_is_utc: bool,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+
+        // ClickHouse-specific: for Timestamp columns, if the server timezone
+        // is UTC, treat bare datetime strings as TimestampTz (append Z).
+        if server_tz_is_utc
+            && col.col_type == SimpleType::Timestamp
+            && let Some(s) = value.as_str()
+            && s.len() >= 19
+            && s.as_bytes().get(10) == Some(&b' ')
+        {
+            let mut iso = String::with_capacity(s.len() + 1);
+            iso.push_str(&s[..10]);
+            iso.push('T');
+            iso.push_str(&s[11..]);
+            iso.push('Z');
+            let coerced = Value::String(iso);
+            crate::arrow_builder::json_value_to_arrow(
+                &coerced,
+                SimpleType::TimestampTz,
+                builder,
+                idx,
+            );
+            continue;
+        }
+
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
 }
 
 /// Sanitize null bytes from a JSON value.
@@ -1251,6 +1327,135 @@ mod tests {
         let (line, col) = parse_clickhouse_error_location(msg, "");
         assert_eq!(line, Some(19));
         assert_eq!(col, Some(25));
+    }
+
+    // --- clickhouse_row_to_arrow ---
+
+    use crate::arrow_builder::ArrowResultBuilder;
+    use arrow::array::{Array, Date32Array, Float64Array, TimestampMicrosecondArray};
+
+    fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
+    }
+
+    /// Convenience: build a one-row Arrow batch from a single-column ClickHouse row.
+    fn ch_row_to_batch(
+        value: Value,
+        col_type: SimpleType,
+        server_tz_is_utc: bool,
+    ) -> arrow::record_batch::RecordBatch {
+        let columns = vec![make_col("col", col_type)];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        clickhouse_row_to_arrow(&[value], &columns, &mut builder, server_tz_is_utc);
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn ch_datetime_utc_server_not_null() {
+        // "2026-01-15 14:30:00" with server_tz_is_utc=true → must not be null
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00".into()),
+            SimpleType::Timestamp,
+            true,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime with UTC server must produce a non-null TimestampTz value"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        // 2026-01-15 14:30:00 UTC in microseconds
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_datetime_non_utc_server_not_null() {
+        // "2026-01-15 14:30:00" with server_tz_is_utc=false → Timestamp (no Z), not null
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00".into()),
+            SimpleType::Timestamp,
+            false,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime with non-UTC server must also produce a non-null Timestamp value"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_date_value_not_null() {
+        let batch = ch_row_to_batch(Value::String("2026-01-15".into()), SimpleType::Date, true);
+        assert!(!batch.column(0).is_null(0), "Date value must not be null");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn ch_number_as_string_not_null() {
+        let batch = ch_row_to_batch(Value::String("42".into()), SimpleType::Number, true);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Number-as-string must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ch_null_value_is_null() {
+        let batch = ch_row_to_batch(Value::Null, SimpleType::Number, true);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn ch_datetime_with_subseconds_utc_not_null() {
+        // DateTime64(3) returns subsecond precision: "2026-01-15 14:30:00.123"
+        let batch = ch_row_to_batch(
+            Value::String("2026-01-15 14:30:00.123".into()),
+            SimpleType::Timestamp,
+            true,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "DateTime64 with subseconds must not be null"
+        );
     }
 
     // --- URL encoding ---

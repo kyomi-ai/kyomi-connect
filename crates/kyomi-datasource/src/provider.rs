@@ -6,6 +6,7 @@
 //!
 //! Wire-compatible with the Python `datasources/base.py` result types.
 
+use arrow::array::Array;
 use serde::{Deserialize, Serialize, Serializer};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,11 @@ impl<'de> Deserialize<'de> for QueryStatus {
 /// Supports pagination with `total_rows` and `has_more` indicators.
 ///
 /// Wire-compatible with Python's `QueryResult` dataclass.
+///
+/// In addition to the JSON `rows` field, `record_batch` carries the same data
+/// in Arrow columnar format for consumers that can use it directly (e.g., the
+/// Arrow-native export pipeline). The field is excluded from serialization
+/// because `RecordBatch` is not serde-serializable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     /// `"success"` or `"error"`.
@@ -86,6 +92,10 @@ pub struct QueryResult {
     pub execution_time_ms: Option<i64>,
     /// Error message if `status == "error"`.
     pub error: Option<String>,
+    /// Arrow columnar representation of the same rows, populated by providers
+    /// that implement native Arrow conversion. Skipped during serialization.
+    #[serde(skip)]
+    pub record_batch: Option<arrow::record_batch::RecordBatch>,
 }
 
 impl QueryResult {
@@ -101,6 +111,7 @@ impl QueryResult {
             bytes_processed: None,
             execution_time_ms: None,
             error: None,
+            record_batch: None,
         }
     }
 
@@ -116,6 +127,7 @@ impl QueryResult {
             bytes_processed: None,
             execution_time_ms: None,
             error: Some(message.into()),
+            record_batch: None,
         }
     }
 }
@@ -181,6 +193,46 @@ pub struct DiscoveryResult {
     pub items: Vec<String>,
     /// Error message if discovery failed; `None` on success.
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Arrow batch helpers
+// ---------------------------------------------------------------------------
+
+/// Extract string values from a single column of an Arrow [`RecordBatch`].
+///
+/// Used by discovery methods (`list_databases`, `list_schemas`, etc.) that
+/// call `execute_query` and then need to read text values out of the result.
+/// Now that `execute_query` sets `rows: None`, callers must read from
+/// `record_batch` instead.
+///
+/// Returns an empty `Vec` if the batch is `None` or the column index is out
+/// of range. Only works for `Utf8` (string) columns.
+pub fn extract_string_col_from_batch(
+    batch: Option<&arrow::record_batch::RecordBatch>,
+    col_idx: usize,
+) -> Vec<String> {
+    let Some(batch) = batch else {
+        return Vec::new();
+    };
+    if col_idx >= batch.num_columns() {
+        return Vec::new();
+    }
+    let col = batch.column(col_idx);
+    col.as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .map(|arr| {
+            (0..arr.len())
+                .filter_map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +369,37 @@ pub trait DatasourceProvider: Send + Sync {
         crate::stream::query_result_to_stream(result)
     }
 
+    /// Execute a SQL query and return results as a stream of Arrow IPC events.
+    ///
+    /// The default implementation calls [`execute_query`](Self::execute_query)
+    /// and wraps the result using
+    /// [`query_result_to_arrow_stream`](crate::stream::query_result_to_arrow_stream).
+    /// All rows are delivered in a single batch.
+    ///
+    /// Providers that support native streaming (e.g., PostgreSQL, MySQL, Redshift)
+    /// should override this to yield rows in multiple batches via
+    /// [`crate::providers::sqlx_common::drive_sqlx_stream_arrow`].
+    ///
+    /// # Arguments
+    /// * `sql` - SQL query to execute.
+    /// * `limit` - Maximum rows to return. `None` for no limit.
+    /// * `offset` - Number of rows to skip. `None` for no offset.
+    /// * `include_total` - If `true`, include total row count estimate.
+    /// * `_chunk_size` - Target rows per batch (unused in default impl).
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        include_total: bool,
+        _chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        let result = self
+            .execute_query(sql, limit, offset, include_total)
+            .await?;
+        crate::stream::query_result_to_arrow_stream(result)
+    }
+
     /// Clean up any open connections or resources.
     ///
     /// Called when the provider is no longer needed. Implementations should
@@ -399,6 +482,7 @@ mod tests {
             bytes_processed: Some(5_000_000),
             execution_time_ms: Some(1234),
             error: None,
+            record_batch: None,
         };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json["status"], "success");

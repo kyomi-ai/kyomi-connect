@@ -48,7 +48,7 @@ use sqlx::{Column, PgPool, Row, TypeInfo};
 use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::providers::aws_sigv4::{self, AwsCredentials};
 use crate::providers::postgres::{
-    char_position_to_line_col, pg_row_value_to_json, pg_type_name_to_oid,
+    char_position_to_line_col, pg_row_to_arrow, pg_row_value_to_json, pg_type_name_to_oid,
 };
 use crate::providers::sqlx_common;
 #[cfg(feature = "ssh")]
@@ -272,6 +272,7 @@ impl DatasourceProvider for RedshiftProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
             Err(_) => {
@@ -287,6 +288,7 @@ impl DatasourceProvider for RedshiftProvider {
                         "Query timed out after {}s",
                         crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
                     )),
+                    record_batch: None,
                 });
             }
         };
@@ -308,29 +310,43 @@ impl DatasourceProvider for RedshiftProvider {
             Vec::new()
         };
 
-        // Convert rows to JSON (reuse PostgreSQL row conversion since wire format is the same)
-        let mut json_rows = Vec::with_capacity(rows_result.len());
+        // Build Arrow RecordBatch (the sole data path — JSON rows are not populated).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
         for row in &rows_result {
-            let mut row_values = Vec::with_capacity(columns.len());
-            for (i, col_info) in columns.iter().enumerate() {
-                let value = pg_row_value_to_json(row, i, col_info.col_type);
-                row_values.push(value);
+            if let Some(ref mut builder) = arrow_builder {
+                redshift_row_to_arrow(row, &columns, builder);
             }
-            json_rows.push(row_values);
         }
 
-        let has_more = json_rows.len() == effective_limit as usize;
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Redshift Arrow batch construction failed");
+                    e
+                })
+                .ok()
+        });
+
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(json_rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None,
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 
@@ -399,6 +415,69 @@ impl DatasourceProvider for RedshiftProvider {
         Ok(stream)
     }
 
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        include_total: bool,
+        chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        let start = Instant::now();
+        let chunk_size = chunk_size.unwrap_or(100) as usize;
+
+        let prepared = sqlx_common::prepare_query(sql, limit, offset);
+
+        // Get total count if requested (only for SELECT/WITH queries)
+        let total_rows = if prepared.is_select && include_total {
+            get_total_count(&self.pool, &prepared.sql_stripped).await
+        } else {
+            None
+        };
+
+        tracing::debug!(
+            sql = %prepared.sql.chars().take(200).collect::<String>(),
+            "Arrow-streaming Redshift query"
+        );
+
+        let paginated_sql = prepared.sql;
+        let pool = self.pool.clone();
+
+        let (tx, stream) = sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
+            sqlx_common::drive_sqlx_stream_arrow(
+                tx,
+                row_stream,
+                total_rows,
+                chunk_size,
+                start,
+                |row: &sqlx::postgres::PgRow| {
+                    use sqlx::{Column, TypeInfo};
+                    row.columns()
+                        .iter()
+                        .map(|col| {
+                            let oid = pg_type_name_to_oid(col.type_info().name());
+                            ColumnInfo {
+                                name: col.name().to_string(),
+                                col_type: map_redshift_type_code(oid),
+                            }
+                        })
+                        .collect()
+                },
+                |row: &sqlx::postgres::PgRow,
+                 columns: &[ColumnInfo],
+                 builder: &mut crate::arrow_builder::ArrowResultBuilder| {
+                    redshift_row_to_arrow(row, columns, builder);
+                },
+            )
+            .await;
+        });
+
+        Ok(stream)
+    }
+
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
         let explain_sql = format!("EXPLAIN {sql}");
 
@@ -439,13 +518,10 @@ impl DatasourceProvider for RedshiftProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items = crate::provider::extract_string_col_from_batch(
+                    result.record_batch.as_ref(),
+                    0,
+                );
                 crate::provider::DiscoveryResult {
                     items,
                     error: None,
@@ -462,6 +538,22 @@ impl DatasourceProvider for RedshiftProvider {
         self.pool.close().await;
         tracing::debug!("Redshift connection pool closed");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Redshift row directly to Arrow column builders.
+///
+/// Redshift is wire-compatible with PostgreSQL, so this delegates directly to
+/// [`pg_row_to_arrow`].
+pub(crate) fn redshift_row_to_arrow(
+    row: &sqlx::postgres::PgRow,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    pg_row_to_arrow(row, columns, builder);
 }
 
 // ---------------------------------------------------------------------------

@@ -501,6 +501,7 @@ impl DatasourceProvider for SnowflakeProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
         };
@@ -551,18 +552,43 @@ impl DatasourceProvider for SnowflakeProvider {
             })
             .unwrap_or_default();
 
-        let has_more = rows.len() == effective_limit as usize;
+        // Build Arrow RecordBatch from the JSON rows (sole data path).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            for row in &rows {
+                snowflake_row_to_arrow(row, &columns, builder);
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Snowflake Arrow batch construction failed");
+                    e
+                })
+                .ok()
+        });
+
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None, // Snowflake REST API doesn't easily expose this
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 
@@ -585,27 +611,18 @@ impl DatasourceProvider for SnowflakeProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| {
-                        // SHOW DATABASES returns: (created_on, name, is_default, is_current, origin, owner, ...)
-                        // name is at index 1
-                        row.get(1).and_then(|v| v.as_str()).map(String::from)
-                    })
-                    .filter(|name| {
-                        let upper = name.to_uppercase();
-                        upper != "SNOWFLAKE" && upper != "SNOWFLAKE_SAMPLE_DATA"
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
-                crate::provider::DiscoveryResult {
-                    items: sorted,
-                    error: None,
-                }
+                // SHOW DATABASES returns: (created_on, name, is_default, is_current, origin, owner, ...)
+                // name is at index 1
+                let mut items: Vec<String> =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 1)
+                        .into_iter()
+                        .filter(|name| {
+                            let upper = name.to_uppercase();
+                            upper != "SNOWFLAKE" && upper != "SNOWFLAKE_SAMPLE_DATA"
+                        })
+                        .collect();
+                items.sort();
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -620,23 +637,12 @@ impl DatasourceProvider for SnowflakeProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| {
-                        // SHOW WAREHOUSES returns: (name, state, type, size, ...)
-                        // name is at index 0
-                        row.first().and_then(|v| v.as_str()).map(String::from)
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
-                crate::provider::DiscoveryResult {
-                    items: sorted,
-                    error: None,
-                }
+                // SHOW WAREHOUSES returns: (name, state, type, size, ...)
+                // name is at index 0
+                let mut items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
+                items.sort();
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -1138,6 +1144,28 @@ fn parse_snowflake_error_line(error_msg: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Snowflake JSON row directly to Arrow column builders.
+///
+/// Snowflake returns rows as JSON arrays in the `"data"` field of the response.
+/// Each element in the array corresponds to a column value. Uses [`SimpleType`]
+/// from `columns` to guide type-aware conversion via the shared
+/// [`crate::arrow_builder::json_value_to_arrow`].
+pub(crate) fn snowflake_row_to_arrow(
+    row: &[Value],
+    columns: &[crate::provider::ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1456,6 +1484,160 @@ hAll+dkyiLjrpRPDdwQ5Stv5rw==
             map_snowflake_type_name("TIMESTAMP_LTZ"),
             SimpleType::TimestampTz
         );
+    }
+
+    // --- snowflake_row_to_arrow ---
+
+    use crate::arrow_builder::ArrowResultBuilder;
+    use crate::provider::{ColumnInfo, SimpleType};
+    use arrow::array::{
+        Array, BooleanArray, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray,
+    };
+
+    fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
+    }
+
+    fn sf_row_to_batch(
+        values: Vec<serde_json::Value>,
+        col_type: SimpleType,
+    ) -> arrow::record_batch::RecordBatch {
+        let columns = vec![make_col("col", col_type)];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        snowflake_row_to_arrow(&values, &columns, &mut builder);
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn sf_number_as_string_not_null() {
+        let batch = sf_row_to_batch(vec![serde_json::json!("42")], SimpleType::Number);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Snowflake number-as-string must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sf_timestamp_epoch_string_not_null() {
+        // Snowflake TIMESTAMP_NTZ returns epoch seconds as a string
+        let epoch_secs = 1_737_000_000.0_f64;
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!(epoch_secs.to_string())],
+            SimpleType::Timestamp,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "Snowflake epoch timestamp must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = (epoch_secs * 1_000_000.0) as i64;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn sf_timestamp_iso_string_not_null() {
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!("2026-01-15T14:30:00")],
+            SimpleType::Timestamp,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "Snowflake ISO timestamp must not be null"
+        );
+    }
+
+    #[test]
+    fn sf_date_string_not_null() {
+        let batch = sf_row_to_batch(vec![serde_json::json!("2026-01-15")], SimpleType::Date);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Snowflake date must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn sf_string_value_not_null() {
+        let batch = sf_row_to_batch(
+            vec![serde_json::json!("hello snowflake")],
+            SimpleType::String,
+        );
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), "hello snowflake");
+    }
+
+    #[test]
+    fn sf_boolean_true_not_null() {
+        let batch = sf_row_to_batch(vec![serde_json::json!("1")], SimpleType::Boolean);
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn sf_null_value_is_null() {
+        let batch = sf_row_to_batch(vec![serde_json::Value::Null], SimpleType::Number);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn sf_multi_column_row() {
+        let columns = vec![
+            make_col("ts", SimpleType::Timestamp),
+            make_col("n", SimpleType::Number),
+            make_col("s", SimpleType::String),
+        ];
+        let row = vec![
+            serde_json::json!("2026-01-15T14:30:00"),
+            serde_json::json!("99"),
+            serde_json::Value::Null,
+        ];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        snowflake_row_to_arrow(&row, &columns, &mut builder);
+        let batch = builder.finish().unwrap();
+
+        assert!(!batch.column(0).is_null(0), "ts must not be null");
+        assert!(!batch.column(1).is_null(0), "n must not be null");
+        assert!(batch.column(2).is_null(0), "null s must be null");
+
+        let arr_n = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr_n.value(0) - 99.0).abs() < f64::EPSILON);
     }
 
     // --- Helper: Pad base64url to standard base64 for decoding ---

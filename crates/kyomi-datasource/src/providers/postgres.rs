@@ -253,6 +253,7 @@ impl DatasourceProvider for PostgresProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
             Err(_) => {
@@ -268,6 +269,7 @@ impl DatasourceProvider for PostgresProvider {
                         "Query timed out after {}s",
                         crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
                     )),
+                    record_batch: None,
                 });
             }
         };
@@ -289,29 +291,43 @@ impl DatasourceProvider for PostgresProvider {
             Vec::new()
         };
 
-        // Convert rows to JSON values
-        let mut json_rows = Vec::with_capacity(rows_result.len());
+        // Build Arrow RecordBatch (the sole data path — JSON rows are not populated).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
         for row in &rows_result {
-            let mut row_values = Vec::with_capacity(columns.len());
-            for (i, col_info) in columns.iter().enumerate() {
-                let value = pg_row_value_to_json(row, i, col_info.col_type);
-                row_values.push(value);
+            if let Some(ref mut builder) = arrow_builder {
+                pg_row_to_arrow(row, &columns, builder);
             }
-            json_rows.push(row_values);
         }
 
-        let has_more = json_rows.len() == effective_limit as usize;
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "PostgreSQL Arrow batch construction failed");
+                    e
+                })
+                .ok()
+        });
+
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = row_count == effective_limit as usize;
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(json_rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None,
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 
@@ -405,6 +421,68 @@ impl DatasourceProvider for PostgresProvider {
         Ok(stream)
     }
 
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        include_total: bool,
+        chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        let start = Instant::now();
+        let chunk_size = chunk_size.unwrap_or(100) as usize;
+
+        let prepared = super::sqlx_common::prepare_query(sql, limit, offset);
+
+        // Get total count if requested (only for SELECT/WITH queries)
+        let total_rows = if prepared.is_select && include_total {
+            get_total_count(&self.pool, &prepared.sql_stripped).await
+        } else {
+            None
+        };
+
+        tracing::debug!(
+            sql = %prepared.sql.chars().take(200).collect::<String>(),
+            "Arrow-streaming PostgreSQL query"
+        );
+
+        let paginated_sql = prepared.sql;
+        let pool = self.pool.clone();
+
+        let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
+            super::sqlx_common::drive_sqlx_stream_arrow(
+                tx,
+                row_stream,
+                total_rows,
+                chunk_size,
+                start,
+                |row: &sqlx::postgres::PgRow| {
+                    row.columns()
+                        .iter()
+                        .map(|col| {
+                            let oid = col_type_oid(col);
+                            ColumnInfo {
+                                name: col.name().to_string(),
+                                col_type: map_postgres_type_oid(oid),
+                            }
+                        })
+                        .collect()
+                },
+                |row: &sqlx::postgres::PgRow,
+                 columns: &[ColumnInfo],
+                 builder: &mut crate::arrow_builder::ArrowResultBuilder| {
+                    pg_row_to_arrow(row, columns, builder);
+                },
+            )
+            .await;
+        });
+
+        Ok(stream)
+    }
+
     async fn list_databases(&self) -> crate::provider::DiscoveryResult {
         match self
             .execute_query(
@@ -418,13 +496,8 @@ impl DatasourceProvider for PostgresProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -447,13 +520,8 @@ impl DatasourceProvider for PostgresProvider {
             .await
         {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .collect();
+                let items =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0);
                 crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
@@ -646,7 +714,10 @@ pub(crate) fn pg_row_value_to_json(
                 serde_json::json!(v)
             } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
                 // NUMERIC/DECIMAL — lossless decode, convert to f64 for JSON
-                serde_json::json!(v.to_string().parse::<f64>().unwrap_or(0.0))
+                match v.to_string().parse::<f64>() {
+                    Ok(f) => serde_json::json!(f),
+                    Err(_) => Value::Null,
+                }
             } else if let Ok(Some(v)) =
                 row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
             {
@@ -714,6 +785,105 @@ pub(crate) fn pg_row_value_to_json(
                 .unwrap_or(Value::Null)
         }
     }
+}
+
+/// Append a PostgreSQL row's values directly to an [`ArrowResultBuilder`].
+///
+/// This is the Arrow counterpart of [`pg_row_value_to_json`]. Instead of
+/// creating `serde_json::Value` intermediaries, native Rust types go directly
+/// into Arrow column builders, preserving date/time/timestamp precision.
+///
+/// Also used by the Redshift provider (which shares the PostgreSQL wire protocol).
+pub(crate) fn pg_row_to_arrow(
+    row: &sqlx::postgres::PgRow,
+    columns: &[ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    use crate::provider::SimpleType;
+
+    for (idx, col) in columns.iter().enumerate() {
+        match col.col_type {
+            SimpleType::Boolean => match row.try_get::<Option<bool>, _>(idx) {
+                Ok(Some(v)) => builder.append_bool(idx, v),
+                _ => builder.append_null(idx),
+            },
+            SimpleType::Number => {
+                // Try i32 → i64 → i16 → f32 → f64 → Decimal → PgMoney
+                if let Ok(Some(v)) = row.try_get::<Option<i32>, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(idx) {
+                    builder.append_i64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<Option<i16>, _>(idx) {
+                    builder.append_i64(idx, v as i64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<f32>, _>(idx) {
+                    builder.append_f64(idx, v as f64);
+                } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
+                    builder.append_f64(idx, v);
+                } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
+                    if let Ok(f) = v.to_string().parse::<f64>() {
+                        builder.append_f64(idx, f);
+                    } else {
+                        builder.append_null(idx);
+                    }
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
+                {
+                    builder.append_f64(idx, v.0 as f64 / 100.0);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::String => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else if let Ok(Some(v)) =
+                    row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(idx)
+                {
+                    builder.append_string(idx, &format_pg_interval(&v));
+                } else if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+                    builder.append_string(idx, &format!("\\x{}", hex::encode(&v)));
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Date => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDate>, _>(idx) {
+                    builder.append_naive_date(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Time => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveTime>, _>(idx) {
+                    builder.append_naive_time(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Timestamp => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
+                    builder.append_naive_datetime(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::TimestampTz => {
+                if let Ok(Some(v)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx) {
+                    builder.append_datetime_utc(idx, v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+            SimpleType::Unknown => {
+                if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
+                    builder.append_string(idx, &v);
+                } else {
+                    builder.append_null(idx);
+                }
+            }
+        }
+    }
+    builder.finish_row();
 }
 
 /// Parse PostgreSQL error for line/column position.

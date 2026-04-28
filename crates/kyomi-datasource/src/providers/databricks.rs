@@ -455,6 +455,7 @@ impl DatasourceProvider for DatabricksProvider {
                     bytes_processed: None,
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
+                    record_batch: None,
                 });
             }
         };
@@ -491,18 +492,43 @@ impl DatasourceProvider for DatabricksProvider {
 
         let rows = self.fetch_all_chunks(&result, statement_id).await;
 
-        let has_more = limit.is_some_and(|lim| rows.len() == lim as usize);
+        // Build Arrow RecordBatch from the JSON rows (sole data path).
+        let mut arrow_builder = if !columns.is_empty() {
+            Some(crate::arrow_builder::ArrowResultBuilder::new(&columns))
+        } else {
+            None
+        };
+
+        if let Some(ref mut builder) = arrow_builder {
+            for row in &rows {
+                databricks_row_to_arrow(row, &columns, builder);
+            }
+        }
+
+        let record_batch = arrow_builder.and_then(|builder| {
+            builder
+                .finish()
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Databricks Arrow batch construction failed");
+                    e
+                })
+                .ok()
+        });
+
+        let row_count = record_batch.as_ref().map_or(0, |b| b.num_rows());
+        let has_more = limit.is_some_and(|lim| row_count == lim as usize);
         let execution_time_ms = start.elapsed().as_millis() as i64;
 
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: Some(rows),
+            rows: None,
             total_rows,
             has_more,
             bytes_processed: None, // Databricks doesn't expose this easily
             execution_time_ms: Some(execution_time_ms),
             error: None,
+            record_batch,
         })
     }
 
@@ -522,23 +548,16 @@ impl DatasourceProvider for DatabricksProvider {
     async fn list_catalogs(&self) -> crate::provider::DiscoveryResult {
         match self.execute_query("SHOW CATALOGS", None, None, false).await {
             Ok(result) => {
-                let items: Vec<String> = result
-                    .rows
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-                    .filter(|name| {
-                        let lower = name.to_lowercase();
-                        lower != "system" && lower != "hive_metastore"
-                    })
-                    .collect();
-                let mut sorted = items;
-                sorted.sort();
-                crate::provider::DiscoveryResult {
-                    items: sorted,
-                    error: None,
-                }
+                let mut items: Vec<String> =
+                    crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0)
+                        .into_iter()
+                        .filter(|name| {
+                            let lower = name.to_lowercase();
+                            lower != "system" && lower != "hive_metastore"
+                        })
+                        .collect();
+                items.sort();
+                crate::provider::DiscoveryResult { items, error: None }
             }
             Err(e) => crate::provider::DiscoveryResult {
                 items: vec![],
@@ -902,6 +921,28 @@ fn parse_databricks_error_line(error_msg: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Arrow conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a Databricks JSON row directly to Arrow column builders.
+///
+/// Databricks returns rows as JSON arrays in the `"data_array"` field of
+/// each chunk. Each element in the array corresponds to a column value.
+/// Uses [`SimpleType`] from `columns` to guide type-aware conversion via
+/// the shared [`crate::arrow_builder::json_value_to_arrow`].
+pub(crate) fn databricks_row_to_arrow(
+    row: &[Value],
+    columns: &[crate::provider::ColumnInfo],
+    builder: &mut crate::arrow_builder::ArrowResultBuilder,
+) {
+    for (idx, col) in columns.iter().enumerate() {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+        crate::arrow_builder::json_value_to_arrow(value, col.col_type, builder, idx);
+    }
+    builder.finish_row();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -957,6 +998,152 @@ mod tests {
     }
 
     // --- M2M OAuth token exchange ---
+
+    // --- databricks_row_to_arrow ---
+
+    use crate::arrow_builder::ArrowResultBuilder;
+    use crate::provider::{ColumnInfo, SimpleType};
+    use arrow::array::{
+        Array, BooleanArray, Date32Array, Float64Array, StringArray, TimestampMicrosecondArray,
+    };
+
+    fn make_col(name: &str, col_type: SimpleType) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            col_type,
+        }
+    }
+
+    fn db_row_to_batch(
+        values: Vec<serde_json::Value>,
+        col_type: SimpleType,
+    ) -> arrow::record_batch::RecordBatch {
+        let columns = vec![make_col("col", col_type)];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        databricks_row_to_arrow(&values, &columns, &mut builder);
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn db_number_as_string_not_null() {
+        let batch = db_row_to_batch(vec![serde_json::json!("42")], SimpleType::Number);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks number-as-string must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn db_timestamp_string_not_null() {
+        // Databricks TIMESTAMP comes as "YYYY-MM-DD HH:MM:SS" string
+        let batch = db_row_to_batch(
+            vec![serde_json::json!("2026-01-15 14:30:00")],
+            SimpleType::Timestamp,
+        );
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks timestamp must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn db_date_string_not_null() {
+        let batch = db_row_to_batch(vec![serde_json::json!("2026-01-15")], SimpleType::Date);
+        assert!(
+            !batch.column(0).is_null(0),
+            "Databricks date must not be null"
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(arr.value(0), expected);
+    }
+
+    #[test]
+    fn db_string_value_not_null() {
+        let batch = db_row_to_batch(
+            vec![serde_json::json!("hello databricks")],
+            SimpleType::String,
+        );
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), "hello databricks");
+    }
+
+    #[test]
+    fn db_boolean_string_not_null() {
+        let batch = db_row_to_batch(vec![serde_json::json!("true")], SimpleType::Boolean);
+        assert!(!batch.column(0).is_null(0));
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(arr.value(0));
+    }
+
+    #[test]
+    fn db_null_value_is_null() {
+        let batch = db_row_to_batch(vec![serde_json::Value::Null], SimpleType::Number);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn db_multi_column_row() {
+        let columns = vec![
+            make_col("ts", SimpleType::Timestamp),
+            make_col("n", SimpleType::Number),
+            make_col("s", SimpleType::String),
+        ];
+        let row = vec![
+            serde_json::json!("2026-01-15 14:30:00"),
+            serde_json::json!("77"),
+            serde_json::Value::Null,
+        ];
+        let mut builder = ArrowResultBuilder::new(&columns);
+        databricks_row_to_arrow(&row, &columns, &mut builder);
+        let batch = builder.finish().unwrap();
+
+        assert!(!batch.column(0).is_null(0), "ts must not be null");
+        assert!(!batch.column(1).is_null(0), "n must not be null");
+        assert!(batch.column(2).is_null(0), "null s must be null");
+
+        let arr_n = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((arr_n.value(0) - 77.0).abs() < f64::EPSILON);
+    }
 
     #[tokio::test]
     async fn m2m_token_exchange_success() {
