@@ -96,6 +96,18 @@ pub struct QueryResult {
     /// that implement native Arrow conversion. Skipped during serialization.
     #[serde(skip)]
     pub record_batch: Option<arrow::record_batch::RecordBatch>,
+    /// Server-side job identifier for stateful pagination.
+    ///
+    /// Some providers (e.g., BigQuery) maintain server-side query cursors
+    /// identified by a job ID. When paginating, the caller passes this ID back
+    /// via `execute_query`'s `job_id` parameter so the provider can resume from
+    /// the existing job instead of re-executing the query. `None` for providers
+    /// that don't support stateful pagination, or for the first page of a query.
+    ///
+    /// This field is not part of the JSON wire format — it is only used
+    /// internally by the Arrow HTTP endpoint for multi-page streaming.
+    #[serde(skip)]
+    pub job_id: Option<String>,
 }
 
 impl QueryResult {
@@ -112,6 +124,7 @@ impl QueryResult {
             execution_time_ms: None,
             error: None,
             record_batch: None,
+            job_id: None,
         }
     }
 
@@ -128,6 +141,7 @@ impl QueryResult {
             execution_time_ms: None,
             error: Some(message.into()),
             record_batch: None,
+            job_id: None,
         }
     }
 }
@@ -261,12 +275,20 @@ pub trait DatasourceProvider: Send + Sync {
     /// * `limit` - Maximum rows to return (page size). `None` for no limit.
     /// * `offset` - Number of rows to skip (for pagination). `None` for no offset.
     /// * `include_total` - If `true`, include total row count (may be slow).
+    /// * `job_id` - Optional server-side job identifier for stateful pagination.
+    ///   Some providers (e.g., BigQuery) maintain server-side query cursors
+    ///   identified by a job ID. On the first page, pass `None` to execute the
+    ///   query fresh. On subsequent pages, pass back the `job_id` from the
+    ///   previous `QueryResult` so the provider can resume from the existing
+    ///   server-side cursor without re-executing the query. Ignored by providers
+    ///   that don't support stateful pagination.
     async fn execute_query(
         &self,
         sql: &str,
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult>;
 
     /// Validate SQL syntax without executing.
@@ -366,7 +388,7 @@ pub trait DatasourceProvider: Send + Sync {
         _chunk_size: Option<u32>,
     ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
         let result = self
-            .execute_query(sql, limit, offset, include_total)
+            .execute_query(sql, limit, offset, include_total, None)
             .await?;
         crate::stream::query_result_to_arrow_stream(result)
     }
@@ -454,6 +476,7 @@ mod tests {
             execution_time_ms: Some(1234),
             error: None,
             record_batch: None,
+            job_id: None,
         };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json["status"], "success");

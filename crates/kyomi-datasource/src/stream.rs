@@ -158,6 +158,7 @@ mod tests {
             execution_time_ms: Some(42),
             error: None,
             record_batch: Some(batch),
+            job_id: None,
         }
     }
 
@@ -233,6 +234,7 @@ mod tests {
             execution_time_ms: Some(10),
             error: None,
             record_batch: None,
+            job_id: None,
         };
 
         let stream = query_result_to_arrow_stream(result).expect("should succeed");

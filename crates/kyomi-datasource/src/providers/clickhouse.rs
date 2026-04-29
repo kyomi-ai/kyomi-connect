@@ -294,6 +294,7 @@ impl DatasourceProvider for ClickHouseProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
@@ -321,6 +322,7 @@ impl DatasourceProvider for ClickHouseProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -353,6 +355,7 @@ impl DatasourceProvider for ClickHouseProvider {
                 execution_time_ms: Some(start.elapsed().as_millis() as i64),
                 error: Some(body),
                 record_batch: None,
+                job_id: None,
             });
         }
 
@@ -370,6 +373,7 @@ impl DatasourceProvider for ClickHouseProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(format!("Failed to parse ClickHouse response: {e}")),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -477,7 +481,276 @@ impl DatasourceProvider for ClickHouseProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
+            job_id: None,
         })
+    }
+
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        _limit: Option<u32>,
+        _offset: Option<u32>,
+        _include_total: bool,
+        chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        use std::time::Instant;
+
+        use crate::arrow_builder::ArrowResultBuilder;
+        use kyomi_connect_protocol::ArrowStreamEvent;
+
+        let start = Instant::now();
+        let page_size = chunk_size.unwrap_or(10000);
+
+        tracing::debug!(
+            sql = %sql.chars().take(200).collect::<String>(),
+            "ClickHouse: starting Arrow stream"
+        );
+
+        // Strip semicolons from the SQL — we'll append LIMIT/OFFSET for pagination.
+        let sql_stripped = sql.trim().trim_end_matches(';').trim().to_string();
+        let sql_upper = sql_stripped.to_uppercase();
+        let is_select =
+            sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH");
+        let already_has_limit = sql_upper.contains("LIMIT");
+
+        // Clone fields needed by the spawned task — &self cannot cross spawn.
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let database = self.database.clone();
+        let username = self.username.clone();
+        let password = self.password.clone();
+        let server_tz_is_utc = self.server_tz_is_utc;
+
+        let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            let mut offset: u64 = 0;
+            let mut columns: Vec<crate::provider::ColumnInfo> = Vec::new();
+            let mut schema_sent = false;
+            let mut chunk_index: u32 = 0;
+            let mut total_rows_returned: u64 = 0;
+
+            loop {
+                // Build paginated SQL.
+                let paginated_sql = if is_select && !already_has_limit {
+                    format!("{sql_stripped} LIMIT {page_size} OFFSET {offset}")
+                } else {
+                    // Non-SELECT or already has LIMIT — only do one page.
+                    sql_stripped.clone()
+                };
+
+                // Build URL with auth and JSONCompact format.
+                let mut url = format!(
+                    "{}/?database={}&user={}&default_format=JSONCompact",
+                    base_url,
+                    urlencoded(&database),
+                    urlencoded(&username),
+                );
+                if !password.is_empty() {
+                    url.push_str(&format!("&password={}", urlencoded(&password)));
+                }
+
+                let resp = match tokio::time::timeout(
+                    crate::DATASOURCE_TIMEOUT_QUERY,
+                    client.post(&url).body(paginated_sql.clone()).send(),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "ClickHouse HTTP request failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "ClickHouse query timed out after {}s",
+                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let status_code = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+
+                if !status_code.is_success() {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "ClickHouse query error: {body_text}"
+                        ))))
+                        .await;
+                    return;
+                }
+
+                let parsed: serde_json::Value = match serde_json::from_str(&body_text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Failed to parse ClickHouse response: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                // Extract column metadata from "meta" array.
+                let page_columns: Vec<crate::provider::ColumnInfo> = parsed
+                    .get("meta")
+                    .and_then(|m| m.as_array())
+                    .map(|meta| {
+                        meta.iter()
+                            .map(|col| {
+                                let name = col
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let type_str =
+                                    col.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                crate::provider::ColumnInfo {
+                                    name,
+                                    col_type: crate::type_mapping::map_clickhouse_type(type_str),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Extract rows from "data" array.
+                let raw_rows: Vec<Vec<serde_json::Value>> = parsed
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|data| {
+                        data.iter()
+                            .map(|row| {
+                                row.as_array()
+                                    .map(|arr| arr.iter().map(|v| sanitize_null_bytes(v.clone())).collect())
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !schema_sent {
+                    columns = page_columns;
+                    let builder = ArrowResultBuilder::new(&columns);
+                    let schema_ipc =
+                        match super::sqlx_common::schema_to_ipc_bytes(builder.schema()) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                        "Arrow schema serialization error: {e}"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                    if tx
+                        .send(Ok(ArrowStreamEvent::Schema {
+                            schema_ipc,
+                            columns: columns.clone(),
+                            total_rows: None,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    schema_sent = true;
+                } else if page_columns.len() != columns.len() {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                            "ClickHouse schema changed between result pages".into(),
+                        )))
+                        .await;
+                    return;
+                }
+
+                let rows_in_page = raw_rows.len();
+
+                if rows_in_page > 0 {
+                    let mut builder = ArrowResultBuilder::new(&columns);
+                    for row in &raw_rows {
+                        clickhouse_row_to_arrow(row, &columns, &mut builder, server_tz_is_utc);
+                    }
+                    match builder.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            chunk_index += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                    total_rows_returned += rows_in_page as u64;
+                    offset += rows_in_page as u64;
+                }
+
+                // Fewer rows than page size → last page, or non-SELECT → one page only.
+                if rows_in_page < page_size as usize || !is_select || already_has_limit {
+                    break;
+                }
+            }
+
+            // If schema was never sent (zero rows), send empty schema.
+            if !schema_sent {
+                let empty_builder = ArrowResultBuilder::new(&[]);
+                let schema_ipc =
+                    match super::sqlx_common::schema_to_ipc_bytes(empty_builder.schema()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+                let _ = tx
+                    .send(Ok(ArrowStreamEvent::Schema {
+                        schema_ipc,
+                        columns: Vec::new(),
+                        total_rows: None,
+                    }))
+                    .await;
+            }
+
+            let execution_time_ms = start.elapsed().as_millis() as i64;
+            let _ = tx
+                .send(Ok(ArrowStreamEvent::Complete {
+                    execution_time_ms: Some(execution_time_ms),
+                    bytes_processed: None,
+                    total_chunks: chunk_index,
+                    total_rows_returned,
+                }))
+                .await;
+        });
+
+        Ok(stream)
     }
 
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
@@ -508,6 +781,7 @@ impl DatasourceProvider for ClickHouseProvider {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         {

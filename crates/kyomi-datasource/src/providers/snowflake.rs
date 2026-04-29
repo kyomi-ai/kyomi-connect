@@ -405,6 +405,7 @@ impl DatasourceProvider for SnowflakeProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
@@ -439,6 +440,7 @@ impl DatasourceProvider for SnowflakeProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -526,7 +528,506 @@ impl DatasourceProvider for SnowflakeProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
+            job_id: None,
         })
+    }
+
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        _limit: Option<u32>,
+        _offset: Option<u32>,
+        _include_total: bool,
+        _chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        use std::time::Instant;
+
+        use crate::arrow_builder::ArrowResultBuilder;
+        use kyomi_connect_protocol::ArrowStreamEvent;
+
+        let start = Instant::now();
+
+        tracing::debug!(
+            sql = %sql.chars().take(200).collect::<String>(),
+            "Snowflake: starting Arrow stream"
+        );
+
+        // Clone fields needed by the spawned task — &self cannot cross spawn.
+        let client = self.client.clone();
+        let statements_url = self.statements_url();
+        let token = self.token.clone();
+        let auth_type = self.auth_type;
+        let warehouse = self.warehouse.clone();
+        let database = self.database.clone();
+        let schema = self.schema.clone();
+        let role = self.role.clone();
+        let account = self.account.clone();
+        let sql = sql.to_string();
+
+        let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            // Submit the statement and poll for completion.
+            let mut body = serde_json::json!({
+                "statement": sql,
+                "timeout": 120,
+            });
+
+            if let Some(body_obj) = body.as_object_mut() {
+                if let Some(ref wh) = warehouse {
+                    body_obj.insert("warehouse".into(), serde_json::Value::String(wh.clone()));
+                }
+                if let Some(ref db) = database {
+                    body_obj.insert("database".into(), serde_json::Value::String(db.clone()));
+                }
+                if let Some(ref s) = schema {
+                    body_obj.insert("schema".into(), serde_json::Value::String(s.clone()));
+                }
+                if let Some(ref r) = role {
+                    body_obj.insert("role".into(), serde_json::Value::String(r.clone()));
+                }
+            }
+
+            let mut request = client
+                .post(&statements_url)
+                .bearer_auth(&token)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+
+            if auth_type == AuthType::KeypairJwt {
+                request =
+                    request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+            }
+
+            let response = match tokio::time::timeout(
+                crate::DATASOURCE_TIMEOUT_QUERY,
+                request.json(&body).send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Snowflake HTTP request failed: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Snowflake statement timed out after {}s",
+                            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            let status = response.status();
+            let initial_body: serde_json::Value = match response.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Failed to parse Snowflake response: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            if status.is_client_error() || status.is_server_error() {
+                let msg = initial_body
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown Snowflake error")
+                    .to_string();
+                let _ = tx
+                    .send(Err(kyomi_connect_protocol::Error::Internal(msg)))
+                    .await;
+                return;
+            }
+
+            // Poll if async.
+            let code = initial_body
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+
+            let result_body = if code == "333334" {
+                // Async — need to poll.
+                let handle = match initial_body
+                    .get("statementHandle")
+                    .and_then(|h| h.as_str())
+                {
+                    Some(h) => h.to_string(),
+                    None => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(
+                                "Snowflake response missing statementHandle".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let poll_url = format!("{statements_url}/{handle}");
+                let deadline = Instant::now() + STATEMENT_POLL_TIMEOUT;
+
+                loop {
+                    if Instant::now() > deadline {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(
+                                "Snowflake statement polling timed out".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+
+                    tokio::time::sleep(STATEMENT_POLL_INTERVAL).await;
+
+                    let mut poll_req =
+                        client.get(&poll_url).bearer_auth(&token).header("Accept", "application/json");
+                    if auth_type == AuthType::KeypairJwt {
+                        poll_req = poll_req
+                            .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+                    }
+
+                    let poll_resp = match tokio::time::timeout(
+                        crate::DATASOURCE_TIMEOUT_QUERY,
+                        poll_req.send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Snowflake poll failed: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Snowflake poll timed out after {}s",
+                                    crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let poll_body: serde_json::Value = match poll_resp.json().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Failed to parse Snowflake poll response: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let poll_code = poll_body.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                    if poll_code == "333334" {
+                        continue;
+                    }
+
+                    let poll_status =
+                        poll_body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                    if poll_status == "FAILED_WITH_ERROR" {
+                        let msg = poll_body
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Snowflake statement failed")
+                            .to_string();
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(msg)))
+                            .await;
+                        return;
+                    }
+
+                    break poll_body;
+                }
+            } else {
+                initial_body
+            };
+
+            // Extract column metadata from resultSetMetaData.rowType.
+            let columns: Vec<crate::provider::ColumnInfo> = result_body
+                .get("resultSetMetaData")
+                .and_then(|meta| meta.get("rowType"))
+                .and_then(|rt| rt.as_array())
+                .map(|row_types| {
+                    row_types
+                        .iter()
+                        .map(|col| {
+                            let name = col
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let col_type = col
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .and_then(snowflake_type_name_to_code)
+                                .map(crate::type_mapping::map_snowflake_type_code)
+                                .unwrap_or_else(|| {
+                                    col.get("type")
+                                        .and_then(|t| t.as_str())
+                                        .map(map_snowflake_type_name)
+                                        .unwrap_or(crate::provider::SimpleType::Unknown)
+                                });
+                            crate::provider::ColumnInfo { name, col_type }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Send the schema event.
+            let arrow_builder = ArrowResultBuilder::new(&columns);
+            let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(arrow_builder.schema()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Arrow schema serialization error: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            if tx
+                .send(Ok(ArrowStreamEvent::Schema {
+                    schema_ipc,
+                    columns: columns.clone(),
+                    total_rows: None,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            // Determine partition count from resultSetMetaData.partitionInfo.
+            let partition_count = result_body
+                .get("resultSetMetaData")
+                .and_then(|m| m.get("partitionInfo"))
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(1)
+                .max(1);
+
+            let mut chunk_index: u32 = 0;
+            let mut total_rows_returned: u64 = 0;
+
+            // Partition 0: inline data in result_body["data"].
+            {
+                let rows: Vec<Vec<serde_json::Value>> = result_body
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|data| {
+                        data.iter()
+                            .map(|row| row.as_array().cloned().unwrap_or_default())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !rows.is_empty() {
+                    let mut builder = ArrowResultBuilder::new(&columns);
+                    for row in &rows {
+                        snowflake_row_to_arrow(row, &columns, &mut builder);
+                    }
+                    match builder.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            chunk_index += 1;
+                            total_rows_returned += rows.len() as u64;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Remaining partitions: fetch via REST API.
+            let handle_opt = result_body
+                .get("statementHandle")
+                .and_then(|h| h.as_str())
+                .map(String::from);
+
+            for partition_idx in 1..partition_count {
+                let handle = match handle_opt.as_deref() {
+                    Some(h) => h,
+                    None => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(
+                                "Snowflake: missing statementHandle for multi-partition fetch"
+                                    .into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let part_url = format!(
+                    "https://{account}.snowflakecomputing.com/api/v2/statements/{handle}/result?partition={partition_idx}"
+                );
+
+                let mut part_req = client
+                    .get(&part_url)
+                    .bearer_auth(&token)
+                    .header("Accept", "application/json");
+                if auth_type == AuthType::KeypairJwt {
+                    part_req = part_req
+                        .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+                }
+
+                let part_resp = match tokio::time::timeout(
+                    crate::DATASOURCE_TIMEOUT_QUERY,
+                    part_req.send(),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Snowflake partition {partition_idx} fetch failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Snowflake partition {partition_idx} fetch timed out after {}s",
+                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let status_code = part_resp.status();
+                let part_body: serde_json::Value = match part_resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Failed to parse Snowflake partition {partition_idx}: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                if status_code.is_client_error() || status_code.is_server_error() {
+                    let msg = part_body
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Snowflake partition fetch failed")
+                        .to_string();
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Snowflake partition {partition_idx}: {msg}"
+                        ))))
+                        .await;
+                    return;
+                }
+
+                // Validate schema consistency.
+                let part_col_count = part_body
+                    .get("resultSetMetaData")
+                    .and_then(|m| m.get("rowType"))
+                    .and_then(|rt| rt.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or(columns.len());
+
+                if part_col_count != columns.len() {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                            "Snowflake schema changed between partitions".into(),
+                        )))
+                        .await;
+                    return;
+                }
+
+                let rows: Vec<Vec<serde_json::Value>> = part_body
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|data| {
+                        data.iter()
+                            .map(|row| row.as_array().cloned().unwrap_or_default())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !rows.is_empty() {
+                    let mut builder = ArrowResultBuilder::new(&columns);
+                    for row in &rows {
+                        snowflake_row_to_arrow(row, &columns, &mut builder);
+                    }
+                    match builder.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            chunk_index += 1;
+                            total_rows_returned += rows.len() as u64;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let execution_time_ms = start.elapsed().as_millis() as i64;
+            let _ = tx
+                .send(Ok(ArrowStreamEvent::Complete {
+                    execution_time_ms: Some(execution_time_ms),
+                    bytes_processed: None,
+                    total_chunks: chunk_index,
+                    total_rows_returned,
+                }))
+                .await;
+        });
+
+        Ok(stream)
     }
 
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
@@ -544,7 +1045,7 @@ impl DatasourceProvider for SnowflakeProvider {
 
     async fn list_databases(&self) -> crate::provider::DiscoveryResult {
         match self
-            .execute_query("SHOW DATABASES", None, None, false)
+            .execute_query("SHOW DATABASES", None, None, false, None)
             .await
         {
             Ok(result) => {
@@ -570,7 +1071,7 @@ impl DatasourceProvider for SnowflakeProvider {
 
     async fn list_warehouses(&self) -> crate::provider::DiscoveryResult {
         match self
-            .execute_query("SHOW WAREHOUSES", None, None, false)
+            .execute_query("SHOW WAREHOUSES", None, None, false, None)
             .await
         {
             Ok(result) => {

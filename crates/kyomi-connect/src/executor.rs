@@ -126,6 +126,7 @@ impl CommandExecutor {
                     params.limit,
                     params.offset,
                     params.include_total,
+                    params.job_id.as_deref(),
                 )
                 .await
             {
@@ -199,6 +200,7 @@ impl CommandExecutor {
                             bytes_processed,
                             total_chunks: 1,
                             total_rows_returned: row_count,
+                            job_id: result.job_id.clone(),
                         },
                     },
                 ];
@@ -308,6 +310,7 @@ impl CommandExecutor {
                             bytes_processed,
                             total_chunks,
                             total_rows_returned,
+                            job_id: None,
                         },
                     });
                 }
@@ -407,7 +410,7 @@ impl CommandExecutor {
 
         let result = self
             .provider
-            .execute_query(sql, None, None, false)
+            .execute_query(sql, None, None, false, None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list containers: {e}"))?;
 
@@ -453,7 +456,7 @@ impl CommandExecutor {
 
         let result = self
             .provider
-            .execute_query(&sql, None, None, false)
+            .execute_query(&sql, None, None, false, None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list tables in '{container}': {e}"))?;
 
@@ -513,7 +516,7 @@ impl CommandExecutor {
 
         let result = self
             .provider
-            .execute_query(&sql, None, None, false)
+            .execute_query(&sql, None, None, false, None)
             .await
             .map_err(|e| {
                 anyhow::anyhow!("Failed to list columns for '{container}.{table_name}': {e}")

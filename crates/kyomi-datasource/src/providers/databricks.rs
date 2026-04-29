@@ -424,6 +424,7 @@ impl DatasourceProvider for DatabricksProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
@@ -455,6 +456,7 @@ impl DatasourceProvider for DatabricksProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -528,7 +530,457 @@ impl DatasourceProvider for DatabricksProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
+            job_id: None,
         })
+    }
+
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        _limit: Option<u32>,
+        _offset: Option<u32>,
+        _include_total: bool,
+        _chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        use std::time::Instant;
+
+        use crate::arrow_builder::ArrowResultBuilder;
+        use kyomi_connect_protocol::ArrowStreamEvent;
+
+        let start = Instant::now();
+
+        tracing::debug!(
+            sql = %sql.chars().take(200).collect::<String>(),
+            "Databricks: starting Arrow stream"
+        );
+
+        // Clone fields needed by the spawned task — &self cannot cross spawn.
+        let client = self.client.clone();
+        let statements_url = self.statements_url();
+        let token = self.token.clone();
+        let warehouse_id = self.warehouse_id.clone();
+        let catalog = self.catalog.clone();
+        let schema = self.schema.clone();
+        let server_hostname = self.server_hostname.clone();
+        let sql = sql.to_string();
+
+        let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            // Submit statement.
+            let mut body = serde_json::json!({
+                "statement": sql,
+                "warehouse_id": warehouse_id,
+                "wait_timeout": "120s",
+                "disposition": "INLINE",
+            });
+
+            if let Some(body_obj) = body.as_object_mut() {
+                if let Some(ref cat) = catalog {
+                    body_obj.insert("catalog".into(), serde_json::Value::String(cat.clone()));
+                }
+                if let Some(ref s) = schema {
+                    body_obj.insert("schema".into(), serde_json::Value::String(s.clone()));
+                }
+            }
+
+            let response = match tokio::time::timeout(
+                crate::DATASOURCE_TIMEOUT_QUERY,
+                client
+                    .post(&statements_url)
+                    .bearer_auth(&token)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Databricks HTTP request failed: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Databricks statement timed out after {}s",
+                            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            let initial_body: serde_json::Value = match response.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Failed to parse Databricks response: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            // Poll until SUCCEEDED if needed.
+            let result_body = {
+                let state = initial_body
+                    .get("status")
+                    .and_then(|s| s.get("state"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+
+                match state {
+                    "SUCCEEDED" => initial_body,
+                    "FAILED" | "CLOSED" | "CANCELED" => {
+                        let msg = initial_body
+                            .get("status")
+                            .and_then(|s| s.get("error"))
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Databricks statement failed")
+                            .to_string();
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(msg)))
+                            .await;
+                        return;
+                    }
+                    _ => {
+                        // PENDING or RUNNING — poll.
+                        let statement_id = match initial_body
+                            .get("statement_id")
+                            .and_then(|id| id.as_str())
+                        {
+                            Some(id) => id.to_string(),
+                            None => {
+                                let _ = tx
+                                    .send(Err(kyomi_connect_protocol::Error::Internal(
+                                        "Databricks response missing statement_id".into(),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let poll_url = format!(
+                            "https://{server_hostname}/api/2.0/sql/statements/{statement_id}"
+                        );
+                        let deadline = Instant::now() + STATEMENT_POLL_TIMEOUT;
+
+                        loop {
+                            if Instant::now() > deadline {
+                                let _ = tx
+                                    .send(Err(kyomi_connect_protocol::Error::Internal(
+                                        "Databricks statement polling timed out".into(),
+                                    )))
+                                    .await;
+                                return;
+                            }
+
+                            tokio::time::sleep(STATEMENT_POLL_INTERVAL).await;
+
+                            let poll_resp = match client
+                                .get(&poll_url)
+                                .bearer_auth(&token)
+                                .send()
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                                            format!("Databricks poll failed: {e}"),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            let poll_body: serde_json::Value = match poll_resp.json().await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                                            format!(
+                                                "Failed to parse Databricks poll response: {e}"
+                                            ),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            let poll_state = poll_body
+                                .get("status")
+                                .and_then(|s| s.get("state"))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+
+                            match poll_state {
+                                "SUCCEEDED" => {
+                                    break poll_body;
+                                }
+                                "FAILED" | "CLOSED" | "CANCELED" => {
+                                    let msg = poll_body
+                                        .get("status")
+                                        .and_then(|s| s.get("error"))
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("Databricks statement failed")
+                                        .to_string();
+                                    let _ = tx
+                                        .send(Err(kyomi_connect_protocol::Error::Internal(msg)))
+                                        .await;
+                                    return;
+                                }
+                                "PENDING" | "RUNNING" => continue,
+                                _ => {
+                                    let _ = tx
+                                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                                            format!(
+                                                "Unexpected Databricks state: {poll_state}"
+                                            ),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Extract column metadata from manifest.schema.columns.
+            let columns: Vec<crate::provider::ColumnInfo> = result_body
+                .get("manifest")
+                .and_then(|m| m.get("schema"))
+                .and_then(|s| s.get("columns"))
+                .and_then(|c| c.as_array())
+                .map(|cols| {
+                    cols.iter()
+                        .map(|col| {
+                            let name = col
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let type_text =
+                                col.get("type_text").and_then(|t| t.as_str()).unwrap_or("");
+                            crate::provider::ColumnInfo {
+                                name,
+                                col_type: crate::type_mapping::map_databricks_type(type_text),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Send the schema event.
+            let builder = ArrowResultBuilder::new(&columns);
+            let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(builder.schema()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Arrow schema serialization error: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            if tx
+                .send(Ok(ArrowStreamEvent::Schema {
+                    schema_ipc,
+                    columns: columns.clone(),
+                    total_rows: None,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let statement_id = result_body
+                .get("statement_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let mut chunk_index: u32 = 0;
+            let mut total_rows_returned: u64 = 0;
+
+            // Collect inline data and any additional chunks.
+            let mut next_chunk: Option<u64> = result_body
+                .get("result")
+                .and_then(|r| r.get("next_chunk_index"))
+                .and_then(|idx| idx.as_u64());
+
+            // Inline data_array from the initial result.
+            let inline_rows: Vec<Vec<serde_json::Value>> = result_body
+                .get("result")
+                .and_then(|r| r.get("data_array"))
+                .and_then(|d| d.as_array())
+                .map(|data| {
+                    data.iter()
+                        .map(|row| row.as_array().cloned().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !inline_rows.is_empty() {
+                let mut builder = ArrowResultBuilder::new(&columns);
+                for row in &inline_rows {
+                    databricks_row_to_arrow(row, &columns, &mut builder);
+                }
+                match builder.finish_to_ipc() {
+                    Ok(ipc_bytes) => {
+                        if tx
+                            .send(Ok(ArrowStreamEvent::Batch {
+                                ipc_bytes,
+                                chunk_index,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        chunk_index += 1;
+                        total_rows_returned += inline_rows.len() as u64;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Arrow IPC serialization error: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // Fetch additional chunks.
+            while let Some(ci) = next_chunk {
+                let chunk_url = format!(
+                    "https://{server_hostname}/api/2.0/sql/statements/{statement_id}/result/chunks/{ci}"
+                );
+
+                let chunk_resp = match tokio::time::timeout(
+                    crate::DATASOURCE_TIMEOUT_QUERY,
+                    client.get(&chunk_url).bearer_auth(&token).send(),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Databricks chunk {ci} fetch failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Databricks chunk {ci} fetch timed out after {}s",
+                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let chunk_status = chunk_resp.status();
+                let chunk_body: serde_json::Value = match chunk_resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                "Failed to parse Databricks chunk {ci}: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                if chunk_status.is_client_error() || chunk_status.is_server_error() {
+                    let msg = chunk_body
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Databricks chunk fetch failed")
+                        .to_string();
+                    let _ = tx
+                        .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                            "Databricks chunk {ci}: {msg}"
+                        ))))
+                        .await;
+                    return;
+                }
+
+                let chunk_rows: Vec<Vec<serde_json::Value>> = chunk_body
+                    .get("data_array")
+                    .and_then(|d| d.as_array())
+                    .map(|data| {
+                        data.iter()
+                            .map(|row| row.as_array().cloned().unwrap_or_default())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !chunk_rows.is_empty() {
+                    let mut builder = ArrowResultBuilder::new(&columns);
+                    for row in &chunk_rows {
+                        databricks_row_to_arrow(row, &columns, &mut builder);
+                    }
+                    match builder.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            chunk_index += 1;
+                            total_rows_returned += chunk_rows.len() as u64;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+
+                next_chunk = chunk_body
+                    .get("next_chunk_index")
+                    .and_then(|idx| idx.as_u64());
+            }
+
+            let execution_time_ms = start.elapsed().as_millis() as i64;
+            let _ = tx
+                .send(Ok(ArrowStreamEvent::Complete {
+                    execution_time_ms: Some(execution_time_ms),
+                    bytes_processed: None,
+                    total_chunks: chunk_index,
+                    total_rows_returned,
+                }))
+                .await;
+        });
+
+        Ok(stream)
     }
 
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
@@ -545,7 +997,7 @@ impl DatasourceProvider for DatabricksProvider {
     }
 
     async fn list_catalogs(&self) -> crate::provider::DiscoveryResult {
-        match self.execute_query("SHOW CATALOGS", None, None, false).await {
+        match self.execute_query("SHOW CATALOGS", None, None, false, None).await {
             Ok(result) => {
                 let mut items: Vec<String> =
                     crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0)
