@@ -348,67 +348,6 @@ impl DatasourceProvider for MySqlProvider {
         }
     }
 
-    async fn execute_query_stream(
-        &self,
-        sql: &str,
-        limit: Option<u32>,
-        offset: Option<u32>,
-        include_total: bool,
-        chunk_size: Option<u32>,
-    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::QueryStream> {
-        let start = Instant::now();
-        let chunk_size = chunk_size.unwrap_or(100) as usize;
-
-        let prepared = super::sqlx_common::prepare_query(sql, limit, offset);
-
-        // Get total count if requested
-        let total_rows = if prepared.is_select && include_total {
-            get_total_count(&self.pool, &prepared.sql_stripped).await
-        } else {
-            None
-        };
-
-        tracing::debug!(
-            sql = %prepared.sql.chars().take(200).collect::<String>(),
-            "Streaming MySQL query"
-        );
-
-        let paginated_sql = prepared.sql;
-        let pool = self.pool.clone();
-
-        let (tx, stream) = super::sqlx_common::make_stream_channel();
-
-        tokio::spawn(async move {
-            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
-            super::sqlx_common::drive_sqlx_stream(
-                tx,
-                row_stream,
-                total_rows,
-                chunk_size,
-                start,
-                |row: &sqlx::mysql::MySqlRow| {
-                    row.columns()
-                        .iter()
-                        .map(|col| ColumnInfo {
-                            name: col.name().to_string(),
-                            col_type: map_mysql_type_name(col.type_info().name()),
-                        })
-                        .collect()
-                },
-                |row: &sqlx::mysql::MySqlRow, columns: &[ColumnInfo]| {
-                    let mut row_values = Vec::with_capacity(columns.len());
-                    for (i, col_info) in columns.iter().enumerate() {
-                        row_values.push(mysql_row_value_to_json(row, i, col_info.col_type));
-                    }
-                    row_values
-                },
-            )
-            .await;
-        });
-
-        Ok(stream)
-    }
-
     async fn execute_query_stream_arrow(
         &self,
         sql: &str,
@@ -571,94 +510,10 @@ fn mysql_try_get_bytes_as_string(row: &sqlx::mysql::MySqlRow, idx: usize) -> Opt
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Extract a value from a MySQL row and convert to JSON.
-///
-/// Uses `rust_decimal::Decimal` for proper DECIMAL/NUMERIC decoding, and falls
-/// back to raw bytes for VARBINARY columns (common in MySQL information_schema).
-fn mysql_row_value_to_json(row: &sqlx::mysql::MySqlRow, idx: usize, col_type: SimpleType) -> Value {
-    match col_type {
-        SimpleType::Boolean => row
-            .try_get::<Option<bool>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::Bool)
-            .unwrap_or(Value::Null),
-
-        SimpleType::Number => {
-            if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<u64>, _>(idx) {
-                // MySQL UNSIGNED integer types (BIGINT UNSIGNED, etc.)
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
-                // DECIMAL/NUMERIC — lossless decode, convert to f64 for JSON
-                match v.to_string().parse::<f64>() {
-                    Ok(f) => serde_json::json!(f),
-                    Err(_) => Value::Null,
-                }
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::String => row
-            .try_get::<Option<String>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::String)
-            .or_else(|| mysql_try_get_bytes_as_string(row, idx).map(Value::String))
-            .unwrap_or(Value::Null),
-
-        SimpleType::Date => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDate>, _>(idx) {
-                Value::String(v.format("%Y-%m-%d").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Time => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveTime>, _>(idx) {
-                Value::String(v.format("%H:%M:%S").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Timestamp => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
-                Value::String(v.format("%Y-%m-%dT%H:%M:%S").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::TimestampTz => {
-            // MySQL TIMESTAMP is stored as UTC
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
-                Value::String(format!("{}Z", v.format("%Y-%m-%dT%H:%M:%S")))
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Unknown => row
-            .try_get::<Option<String>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::String)
-            .or_else(|| mysql_try_get_bytes_as_string(row, idx).map(Value::String))
-            .unwrap_or(Value::Null),
-    }
-}
-
 /// Convert a MySQL row directly to Arrow column builders.
 ///
-/// This is the Arrow counterpart of [`mysql_row_value_to_json`]. Instead of
-/// creating `serde_json::Value` intermediaries, native Rust types go directly
-/// into Arrow column builders, preserving date/time/timestamp precision.
+/// Native Rust types go directly into Arrow column builders, preserving
+/// date/time/timestamp precision.
 pub(crate) fn mysql_row_to_arrow(
     row: &sqlx::mysql::MySqlRow,
     columns: &[ColumnInfo],

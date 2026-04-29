@@ -58,7 +58,7 @@ pub struct ConnectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
     /// When `true`, the response will be streamed as multiple messages
-    /// (StreamHeader -> StreamChunk* -> StreamComplete). Used by the cross-replica
+    /// (ArrowHeader -> ArrowBatch* -> ArrowComplete). Used by the cross-replica
     /// command listener to choose between oneshot and mpsc response channels.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streaming: bool,
@@ -111,13 +111,13 @@ pub struct ConnectResponse {
     pub body: ConnectResponseBody,
 }
 
-/// The response payload -- a successful result, error, or streaming event.
+/// The response payload -- a successful result, error, or Arrow streaming event.
 ///
 /// Uses `#[serde(tag = "type")]` (internally tagged):
 /// - Success: `{"type": "result", "result": <Value>}`
 /// - Error: `{"type": "error", "error": "message"}`
-/// - Streaming: `{"type": "stream_header", ...}`, `{"type": "stream_chunk", ...}`,
-///   `{"type": "stream_complete", ...}`
+/// - Arrow streaming: `{"type": "arrow_header", ...}`, `{"type": "arrow_batch", ...}`,
+///   `{"type": "arrow_complete", ...}`
 ///
 /// Combined with `#[serde(flatten)]` on [`ConnectResponse::body`], the `type`
 /// discriminator merges into the top-level JSON alongside `id`.
@@ -130,34 +130,6 @@ pub enum ConnectResponseBody {
     Result { result: serde_json::Value },
     /// Error response with a human-readable message.
     Error { error: String },
-    /// First streaming event: column metadata and optional row count estimate.
-    StreamHeader {
-        /// Column definitions for the result set.
-        columns: Vec<ColumnInfo>,
-        /// Estimated total row count, if available.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        total_rows: Option<i64>,
-    },
-    /// One batch of rows in a streaming response.
-    StreamChunk {
-        /// Row data -- each row is a list of JSON values matching column order.
-        rows: Vec<Vec<serde_json::Value>>,
-        /// Zero-based chunk index for ordering verification.
-        chunk_index: u32,
-    },
-    /// Final streaming event: summary statistics. Signals end of stream.
-    StreamComplete {
-        /// Wall-clock execution time in milliseconds.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        execution_time_ms: Option<i64>,
-        /// Bytes processed by the query engine.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bytes_processed: Option<i64>,
-        /// Number of chunks sent.
-        total_chunks: u32,
-        /// Total rows across all chunks.
-        total_rows_returned: u64,
-    },
     /// Arrow IPC response: schema message with column metadata.
     ///
     /// Sent as the first message when [`QueryParams::format`] is
@@ -535,207 +507,6 @@ mod tests {
         match resp.body {
             ConnectResponseBody::Error { ref error } => assert_eq!(error, "bad SQL"),
             _ => panic!("expected Error variant"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Streaming variant serialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn response_stream_header_serializes_correctly() {
-        let resp = ConnectResponse {
-            id: "sh-1".into(),
-            body: ConnectResponseBody::StreamHeader {
-                columns: vec![
-                    ColumnInfo {
-                        name: "id".into(),
-                        col_type: SimpleType::Number,
-                    },
-                    ColumnInfo {
-                        name: "name".into(),
-                        col_type: SimpleType::String,
-                    },
-                ],
-                total_rows: Some(1000),
-            },
-        };
-
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], "sh-1");
-        assert_eq!(json["type"], "stream_header");
-        assert_eq!(json["columns"][0]["name"], "id");
-        assert_eq!(json["columns"][0]["type"], "number");
-        assert_eq!(json["columns"][1]["name"], "name");
-        assert_eq!(json["total_rows"], 1000);
-    }
-
-    #[test]
-    fn response_stream_header_omits_null_total_rows() {
-        let resp = ConnectResponse {
-            id: "sh-2".into(),
-            body: ConnectResponseBody::StreamHeader {
-                columns: vec![],
-                total_rows: None,
-            },
-        };
-
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["type"], "stream_header");
-        assert!(json.get("total_rows").is_none());
-    }
-
-    #[test]
-    fn response_stream_chunk_serializes_correctly() {
-        let resp = ConnectResponse {
-            id: "sc-1".into(),
-            body: ConnectResponseBody::StreamChunk {
-                rows: vec![vec![json!(1), json!("Alice")], vec![json!(2), json!("Bob")]],
-                chunk_index: 0,
-            },
-        };
-
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], "sc-1");
-        assert_eq!(json["type"], "stream_chunk");
-        assert_eq!(json["rows"][0][0], 1);
-        assert_eq!(json["rows"][0][1], "Alice");
-        assert_eq!(json["chunk_index"], 0);
-    }
-
-    #[test]
-    fn response_stream_complete_serializes_correctly() {
-        let resp = ConnectResponse {
-            id: "sco-1".into(),
-            body: ConnectResponseBody::StreamComplete {
-                execution_time_ms: Some(456),
-                bytes_processed: Some(10_000_000),
-                total_chunks: 5,
-                total_rows_returned: 5000,
-            },
-        };
-
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], "sco-1");
-        assert_eq!(json["type"], "stream_complete");
-        assert_eq!(json["execution_time_ms"], 456);
-        assert_eq!(json["bytes_processed"], 10_000_000);
-        assert_eq!(json["total_chunks"], 5);
-        assert_eq!(json["total_rows_returned"], 5000);
-    }
-
-    #[test]
-    fn response_stream_complete_omits_null_optional_fields() {
-        let resp = ConnectResponse {
-            id: "sco-2".into(),
-            body: ConnectResponseBody::StreamComplete {
-                execution_time_ms: None,
-                bytes_processed: None,
-                total_chunks: 1,
-                total_rows_returned: 10,
-            },
-        };
-
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["type"], "stream_complete");
-        assert!(json.get("execution_time_ms").is_none());
-        assert!(json.get("bytes_processed").is_none());
-        assert_eq!(json["total_chunks"], 1);
-    }
-
-    #[test]
-    fn response_stream_header_roundtrip() {
-        let resp = ConnectResponse {
-            id: "rt-sh".into(),
-            body: ConnectResponseBody::StreamHeader {
-                columns: vec![ColumnInfo {
-                    name: "id".into(),
-                    col_type: SimpleType::Number,
-                }],
-                total_rows: Some(42),
-            },
-        };
-
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, "rt-sh");
-        match parsed.body {
-            ConnectResponseBody::StreamHeader {
-                columns,
-                total_rows,
-            } => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "id");
-                assert_eq!(total_rows, Some(42));
-            }
-            other => panic!("expected StreamHeader, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn response_stream_chunk_roundtrip() {
-        let resp = ConnectResponse {
-            id: "rt-sc".into(),
-            body: ConnectResponseBody::StreamChunk {
-                rows: vec![vec![json!(99)]],
-                chunk_index: 3,
-            },
-        };
-
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, "rt-sc");
-        match parsed.body {
-            ConnectResponseBody::StreamChunk { rows, chunk_index } => {
-                assert_eq!(rows[0][0], 99);
-                assert_eq!(chunk_index, 3);
-            }
-            other => panic!("expected StreamChunk, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn response_stream_complete_roundtrip() {
-        let resp = ConnectResponse {
-            id: "rt-sco".into(),
-            body: ConnectResponseBody::StreamComplete {
-                execution_time_ms: Some(789),
-                bytes_processed: None,
-                total_chunks: 2,
-                total_rows_returned: 2000,
-            },
-        };
-
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: ConnectResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, "rt-sco");
-        match parsed.body {
-            ConnectResponseBody::StreamComplete {
-                execution_time_ms,
-                bytes_processed,
-                total_chunks,
-                total_rows_returned,
-            } => {
-                assert_eq!(execution_time_ms, Some(789));
-                assert_eq!(bytes_processed, None);
-                assert_eq!(total_chunks, 2);
-                assert_eq!(total_rows_returned, 2000);
-            }
-            other => panic!("expected StreamComplete, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn response_stream_deserializes_from_raw_json() {
-        let raw = r#"{"id":"s-1","type":"stream_chunk","rows":[[1,"x"]],"chunk_index":0}"#;
-        let resp: ConnectResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(resp.id, "s-1");
-        match resp.body {
-            ConnectResponseBody::StreamChunk { rows, chunk_index } => {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(chunk_index, 0);
-            }
-            other => panic!("expected StreamChunk, got {other:?}"),
         }
     }
 

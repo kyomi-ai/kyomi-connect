@@ -47,9 +47,7 @@ use sqlx::{Column, PgPool, Row, TypeInfo};
 
 use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 use crate::providers::aws_sigv4::{self, AwsCredentials};
-use crate::providers::postgres::{
-    char_position_to_line_col, pg_row_to_arrow, pg_row_value_to_json, pg_type_name_to_oid,
-};
+use crate::providers::postgres::{char_position_to_line_col, pg_row_to_arrow, pg_type_name_to_oid};
 use crate::providers::sqlx_common;
 #[cfg(feature = "ssh")]
 use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
@@ -348,71 +346,6 @@ impl DatasourceProvider for RedshiftProvider {
             error: None,
             record_batch,
         })
-    }
-
-    async fn execute_query_stream(
-        &self,
-        sql: &str,
-        limit: Option<u32>,
-        offset: Option<u32>,
-        include_total: bool,
-        chunk_size: Option<u32>,
-    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::QueryStream> {
-        let start = Instant::now();
-        let chunk_size = chunk_size.unwrap_or(100) as usize;
-
-        let prepared = sqlx_common::prepare_query(sql, limit, offset);
-
-        // Get total count if requested (only for SELECT/WITH queries)
-        let total_rows = if prepared.is_select && include_total {
-            get_total_count(&self.pool, &prepared.sql_stripped).await
-        } else {
-            None
-        };
-
-        tracing::debug!(
-            sql = %prepared.sql.chars().take(200).collect::<String>(),
-            "Streaming Redshift query"
-        );
-
-        let paginated_sql = prepared.sql;
-        let pool = self.pool.clone();
-
-        let (tx, stream) = sqlx_common::make_stream_channel();
-
-        tokio::spawn(async move {
-            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
-            sqlx_common::drive_sqlx_stream(
-                tx,
-                row_stream,
-                total_rows,
-                chunk_size,
-                start,
-                |row: &sqlx::postgres::PgRow| {
-                    use sqlx::{Column, TypeInfo};
-                    row.columns()
-                        .iter()
-                        .map(|col| {
-                            let oid = pg_type_name_to_oid(col.type_info().name());
-                            ColumnInfo {
-                                name: col.name().to_string(),
-                                col_type: map_redshift_type_code(oid),
-                            }
-                        })
-                        .collect()
-                },
-                |row: &sqlx::postgres::PgRow, columns: &[ColumnInfo]| {
-                    let mut row_values = Vec::with_capacity(columns.len());
-                    for (i, col_info) in columns.iter().enumerate() {
-                        row_values.push(pg_row_value_to_json(row, i, col_info.col_type));
-                    }
-                    row_values
-                },
-            )
-            .await;
-        });
-
-        Ok(stream)
     }
 
     async fn execute_query_stream_arrow(

@@ -31,9 +31,7 @@ use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{Column, PgPool, Row, TypeInfo};
 
-use crate::provider::{
-    ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus, SimpleType,
-};
+use crate::provider::{ColumnInfo, DatasourceProvider, DryRunResult, QueryResult, QueryStatus};
 #[cfg(feature = "ssh")]
 use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
 use crate::type_mapping::map_postgres_type_oid;
@@ -357,70 +355,6 @@ impl DatasourceProvider for PostgresProvider {
         }
     }
 
-    async fn execute_query_stream(
-        &self,
-        sql: &str,
-        limit: Option<u32>,
-        offset: Option<u32>,
-        include_total: bool,
-        chunk_size: Option<u32>,
-    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::QueryStream> {
-        let start = Instant::now();
-        let chunk_size = chunk_size.unwrap_or(100) as usize;
-
-        let prepared = super::sqlx_common::prepare_query(sql, limit, offset);
-
-        // Get total count if requested (only for SELECT/WITH queries)
-        let total_rows = if prepared.is_select && include_total {
-            get_total_count(&self.pool, &prepared.sql_stripped).await
-        } else {
-            None
-        };
-
-        tracing::debug!(
-            sql = %prepared.sql.chars().take(200).collect::<String>(),
-            "Streaming PostgreSQL query"
-        );
-
-        let paginated_sql = prepared.sql;
-        let pool = self.pool.clone();
-
-        let (tx, stream) = super::sqlx_common::make_stream_channel();
-
-        tokio::spawn(async move {
-            let row_stream = sqlx::query(&paginated_sql).fetch(&pool);
-            super::sqlx_common::drive_sqlx_stream(
-                tx,
-                row_stream,
-                total_rows,
-                chunk_size,
-                start,
-                |row: &sqlx::postgres::PgRow| {
-                    row.columns()
-                        .iter()
-                        .map(|col| {
-                            let oid = col_type_oid(col);
-                            ColumnInfo {
-                                name: col.name().to_string(),
-                                col_type: map_postgres_type_oid(oid),
-                            }
-                        })
-                        .collect()
-                },
-                |row: &sqlx::postgres::PgRow, columns: &[ColumnInfo]| {
-                    let mut row_values = Vec::with_capacity(columns.len());
-                    for (i, col_info) in columns.iter().enumerate() {
-                        row_values.push(pg_row_value_to_json(row, i, col_info.col_type));
-                    }
-                    row_values
-                },
-            )
-            .await;
-        });
-
-        Ok(stream)
-    }
-
     async fn execute_query_stream_arrow(
         &self,
         sql: &str,
@@ -684,114 +618,10 @@ fn format_pg_interval(iv: &sqlx::postgres::types::PgInterval) -> String {
     }
 }
 
-/// Also used by the Redshift provider (which shares the PostgreSQL wire protocol).
-pub(crate) fn pg_row_value_to_json(
-    row: &sqlx::postgres::PgRow,
-    idx: usize,
-    col_type: SimpleType,
-) -> Value {
-    // First try to detect NULL regardless of type
-    // sqlx returns an error for NULL values when try_get expects a non-Option type
-    match col_type {
-        SimpleType::Boolean => row
-            .try_get::<Option<bool>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::Bool)
-            .unwrap_or(Value::Null),
-
-        SimpleType::Number => {
-            // sqlx decodes int2→i16, int4→i32, int8→i64. Try all three.
-            if let Ok(Some(v)) = row.try_get::<Option<i32>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<i16>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<f32>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<f64>, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(Some(v)) = row.try_get::<Option<rust_decimal::Decimal>, _>(idx) {
-                // NUMERIC/DECIMAL — lossless decode, convert to f64 for JSON
-                match v.to_string().parse::<f64>() {
-                    Ok(f) => serde_json::json!(f),
-                    Err(_) => Value::Null,
-                }
-            } else if let Ok(Some(v)) =
-                row.try_get::<Option<sqlx::postgres::types::PgMoney>, _>(idx)
-            {
-                // MONEY — stored as i64 cents, convert to decimal
-                serde_json::json!(v.0 as f64 / 100.0)
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::String => {
-            if let Ok(Some(v)) = row.try_get::<Option<String>, _>(idx) {
-                Value::String(v)
-            } else if let Ok(Some(v)) =
-                row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(idx)
-            {
-                // INTERVAL — format as human-readable string
-                Value::String(format_pg_interval(&v))
-            } else if let Ok(Some(v)) = row.try_get::<Option<Vec<u8>>, _>(idx) {
-                // BYTEA — hex-encode for display
-                Value::String(format!("\\x{}", hex::encode(&v)))
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Date => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDate>, _>(idx) {
-                Value::String(v.format("%Y-%m-%d").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Time => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveTime>, _>(idx) {
-                Value::String(v.format("%H:%M:%S").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Timestamp => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(idx) {
-                Value::String(v.format("%Y-%m-%dT%H:%M:%S").to_string())
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::TimestampTz => {
-            if let Ok(Some(v)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx) {
-                Value::String(v.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-            } else {
-                Value::Null
-            }
-        }
-
-        SimpleType::Unknown => {
-            // Try string as a safe fallback
-            row.try_get::<Option<String>, _>(idx)
-                .ok()
-                .flatten()
-                .map(Value::String)
-                .unwrap_or(Value::Null)
-        }
-    }
-}
-
 /// Append a PostgreSQL row's values directly to an [`ArrowResultBuilder`].
 ///
-/// This is the Arrow counterpart of [`pg_row_value_to_json`]. Instead of
-/// creating `serde_json::Value` intermediaries, native Rust types go directly
-/// into Arrow column builders, preserving date/time/timestamp precision.
+/// Native Rust types go directly into Arrow column builders, preserving
+/// date/time/timestamp precision.
 ///
 /// Also used by the Redshift provider (which shares the PostgreSQL wire protocol).
 pub(crate) fn pg_row_to_arrow(
