@@ -126,7 +126,7 @@ impl CommandExecutor {
                     params.limit,
                     params.offset,
                     params.include_total,
-                    None,
+                    params.job_id.as_deref(),
                 )
                 .await
             {
@@ -200,6 +200,7 @@ impl CommandExecutor {
                             bytes_processed,
                             total_chunks: 1,
                             total_rows_returned: row_count,
+                            job_id: result.job_id.clone(),
                         },
                     },
                 ];
@@ -309,6 +310,7 @@ impl CommandExecutor {
                             bytes_processed,
                             total_chunks,
                             total_rows_returned,
+                            job_id: None,
                         },
                     });
                 }

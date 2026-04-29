@@ -85,6 +85,10 @@ pub struct QueryParams {
     /// compatibility — servers that don't send this field get JSON responses.
     #[serde(default)]
     pub format: crate::stream::QueryFormat,
+    /// Optional server-side job identifier for stateful pagination (e.g. BigQuery).
+    /// Absent from older wire messages — defaults to `None` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
 }
 
 /// Parameters for the `dry_run` operation.
@@ -170,6 +174,10 @@ pub enum ConnectResponseBody {
         total_chunks: u32,
         /// Total rows across all batches.
         total_rows_returned: u64,
+        /// Server-side job identifier for stateful pagination (e.g. BigQuery job ID).
+        /// Absent when the provider does not use server-side jobs.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
     },
 }
 
@@ -299,6 +307,7 @@ mod tests {
             offset: None,
             include_total: false,
             format: QueryFormat::Json,
+            job_id: None,
         };
         let req = ConnectRequest {
             id: "req-1".into(),
@@ -372,6 +381,7 @@ mod tests {
             offset: Some(0),
             include_total: true,
             format: QueryFormat::Json,
+            job_id: None,
         };
         let req = ConnectRequest {
             id: "rt-1".into(),
@@ -523,6 +533,7 @@ mod tests {
             offset: Some(100),
             include_total: true,
             format: QueryFormat::Json,
+            job_id: None,
         };
         let req = ConnectRequest {
             id: "eq-1".into(),
@@ -731,6 +742,7 @@ mod tests {
             offset: None,
             include_total: false,
             format: QueryFormat::Json,
+            job_id: None,
         };
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["sql"], "SELECT 1");
@@ -747,6 +759,7 @@ mod tests {
             offset: Some(50),
             include_total: true,
             format: QueryFormat::Json,
+            job_id: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         let parsed: QueryParams = serde_json::from_str(&json).unwrap();
@@ -917,6 +930,7 @@ mod tests {
             offset: None,
             include_total: false,
             format: QueryFormat::Arrow,
+            job_id: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         let parsed: QueryParams = serde_json::from_str(&json).unwrap();
@@ -1007,6 +1021,7 @@ mod tests {
                 bytes_processed: Some(2_000_000),
                 total_chunks: 3,
                 total_rows_returned: 3000,
+                job_id: None,
             },
         };
 
@@ -1028,6 +1043,7 @@ mod tests {
                 bytes_processed: None,
                 total_chunks: 1,
                 total_rows_returned: 10,
+                job_id: None,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1099,6 +1115,7 @@ mod tests {
                 bytes_processed: None,
                 total_chunks: 2,
                 total_rows_returned: 200,
+                job_id: None,
             },
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1109,11 +1126,13 @@ mod tests {
                 bytes_processed,
                 total_chunks,
                 total_rows_returned,
+                job_id,
             } => {
                 assert_eq!(execution_time_ms, Some(100));
                 assert_eq!(bytes_processed, None);
                 assert_eq!(total_chunks, 2);
                 assert_eq!(total_rows_returned, 200);
+                assert_eq!(job_id, None);
             }
             other => panic!("expected ArrowComplete, got {other:?}"),
         }

@@ -563,31 +563,87 @@ impl DatasourceProvider for BigQueryProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
-        _job_id: Option<&str>,
+        job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
         tracing::debug!(
             sql = %sql.chars().take(200).collect::<String>(),
+            job_id = job_id,
             "Executing BigQuery query"
         );
 
-        let result = match self.run_query(sql, limit, offset, false).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, "BigQuery query error");
-                return Ok(QueryResult {
-                    status: QueryStatus::Error,
-                    columns: None,
-                    rows: None,
-                    total_rows: None,
-                    has_more: false,
-                    bytes_processed: None,
-                    execution_time_ms: Some(start.elapsed().as_millis() as i64),
-                    error: Some(e.to_string()),
-                    record_batch: None,
-                    job_id: None,
-                });
+        // When job_id is provided, skip job submission and fetch results directly
+        // using the cached job.  When absent, submit a new job to get a fresh
+        // job_id.  Either way we end up with (actual_job_id, result_value).
+        let (actual_job_id, result) = if let Some(id) = job_id {
+            tracing::debug!(job_id = id, "BigQuery: resuming from cached job_id");
+            // No job_body available when resuming — pass empty Value so the
+            // statistics merge in get_query_results is a no-op.  The
+            // totalBytesProcessed fallback path in execute_query handles stats.
+            let empty_body = serde_json::Value::Object(serde_json::Map::new());
+            match self
+                .get_query_results(id, "", limit, offset, &empty_body)
+                .await
+            {
+                Ok(r) => (id.to_string(), r),
+                Err(e) => {
+                    tracing::error!(error = %e, job_id = id, "BigQuery cached-job fetch error");
+                    return Ok(QueryResult {
+                        status: QueryStatus::Error,
+                        columns: None,
+                        rows: None,
+                        total_rows: None,
+                        has_more: false,
+                        bytes_processed: None,
+                        execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                        error: Some(e.to_string()),
+                        record_batch: None,
+                        job_id: None,
+                    });
+                }
+            }
+        } else {
+            // Submit a new job and wait for it to complete.
+            match self.submit_query_job(sql, false).await {
+                Ok((new_job_id, location, job_body)) => {
+                    match self
+                        .get_query_results(&new_job_id, &location, limit, offset, &job_body)
+                        .await
+                    {
+                        Ok(r) => (new_job_id, r),
+                        Err(e) => {
+                            tracing::error!(error = %e, "BigQuery query error");
+                            return Ok(QueryResult {
+                                status: QueryStatus::Error,
+                                columns: None,
+                                rows: None,
+                                total_rows: None,
+                                has_more: false,
+                                bytes_processed: None,
+                                execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                                error: Some(e.to_string()),
+                                record_batch: None,
+                                job_id: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "BigQuery job submission error");
+                    return Ok(QueryResult {
+                        status: QueryStatus::Error,
+                        columns: None,
+                        rows: None,
+                        total_rows: None,
+                        has_more: false,
+                        bytes_processed: None,
+                        execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                        error: Some(e.to_string()),
+                        record_batch: None,
+                        job_id: None,
+                    });
+                }
             }
         };
 
@@ -688,7 +744,7 @@ impl DatasourceProvider for BigQueryProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
-            job_id: None,
+            job_id: Some(actual_job_id),
         })
     }
 
