@@ -7,8 +7,8 @@
 //!   PostgreSQL, MySQL, Redshift, ClickHouse, Snowflake, and Databricks.
 //!
 //! - **Arrow stream channel**: [`make_arrow_stream_channel`] creates an mpsc
-//!   channel and converts the receiver into an [`ArrowStream`]. Used by
-//!   PostgreSQL, MySQL, and Redshift providers.
+//!   channel and converts the receiver into an [`ArrowStream`]. Used by all
+//!   providers that implement `execute_query_stream_arrow`.
 //!
 //! - **sqlx Arrow streaming driver**: [`drive_sqlx_stream_arrow`] drives a
 //!   sqlx row stream through the Schema → Batch* → Complete event protocol.
@@ -16,18 +16,15 @@
 
 use std::time::Instant;
 
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use futures_util::StreamExt;
 
 use crate::provider::ColumnInfo;
 use kyomi_connect_protocol::Error;
 
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use crate::arrow_builder::ArrowResultBuilder;
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use arrow::datatypes::Schema;
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use arrow::ipc::writer::StreamWriter;
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use kyomi_connect_protocol::ArrowStreamEvent;
 
 // ---------------------------------------------------------------------------
@@ -128,8 +125,7 @@ pub(crate) fn prepare_query_databricks(
 /// Creates a StreamWriter, which writes the schema as its header, then
 /// immediately finishes. The resulting bytes contain just the schema message
 /// and the end-of-stream marker.
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
-fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, arrow::error::ArrowError> {
+pub(crate) fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buf, schema)?;
     writer.finish()?;
@@ -141,7 +137,6 @@ fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, arrow::error::ArrowEr
 /// Returns `(tx, stream)` where `tx` is the sender to pass to
 /// [`drive_sqlx_stream_arrow`] and `stream` is the `ArrowStream` to return
 /// from `execute_query_stream_arrow`.
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 pub(crate) fn make_arrow_stream_channel() -> (
     tokio::sync::mpsc::Sender<kyomi_connect_protocol::Result<ArrowStreamEvent>>,
     kyomi_connect_protocol::ArrowStream,

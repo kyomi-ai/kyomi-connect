@@ -748,6 +748,442 @@ impl DatasourceProvider for BigQueryProvider {
         })
     }
 
+    async fn execute_query_stream_arrow(
+        &self,
+        sql: &str,
+        _limit: Option<u32>,
+        _offset: Option<u32>,
+        _include_total: bool,
+        chunk_size: Option<u32>,
+    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
+        use std::time::Instant;
+
+        use crate::arrow_builder::ArrowResultBuilder;
+        use kyomi_connect_protocol::ArrowStreamEvent;
+
+        let start = Instant::now();
+        let page_size = chunk_size.unwrap_or(10000);
+
+        // Clone the fields needed by the spawned task — &self cannot cross spawn.
+        let client = self.client.clone();
+        let access_token = self.access_token.clone();
+        let billing_project = self.billing_project.clone();
+        let sql = sql.to_string();
+
+        tracing::debug!(
+            sql = %sql.chars().take(200).collect::<String>(),
+            "BigQuery: starting Arrow stream"
+        );
+
+        let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+        tokio::spawn(async move {
+            // Submit the BigQuery job and wait for it to complete.
+            let (job_id, location, job_body) = {
+                let body = serde_json::json!({
+                    "configuration": {
+                        "query": {
+                            "query": sql,
+                            "useLegacySql": false,
+                        },
+                    }
+                });
+
+                let url = format!(
+                    "{BIGQUERY_API_BASE}/projects/{billing_project}/jobs"
+                );
+
+                let resp = match tokio::time::timeout(
+                    crate::DATASOURCE_TIMEOUT_QUERY,
+                    client
+                        .post(&url)
+                        .bearer_auth(&access_token)
+                        .header("Content-Type", "application/json")
+                        .json(&body)
+                        .send(),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "BigQuery job submission failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "BigQuery job submission timed out after {}s",
+                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let status_code = resp.status();
+                let response_body: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "Failed to parse BigQuery submit response: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                if status_code.is_client_error() || status_code.is_server_error() {
+                    let msg = extract_bigquery_error(&response_body);
+                    let _ = tx.send(Err(Error::Internal(msg))).await;
+                    return;
+                }
+
+                let job_id = response_body
+                    .get("jobReference")
+                    .and_then(|r| r.get("jobId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let location = response_body
+                    .get("jobReference")
+                    .and_then(|r| r.get("location"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if job_id.is_empty() {
+                    let _ = tx
+                        .send(Err(Error::Internal(
+                            "BigQuery response missing jobId".into(),
+                        )))
+                        .await;
+                    return;
+                }
+
+                // Poll until DONE if not already complete.
+                let job_state = response_body
+                    .get("status")
+                    .and_then(|s| s.get("state"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let completed_body = if job_state == "DONE" {
+                    if let Some(err) = response_body
+                        .get("status")
+                        .and_then(|s| s.get("errorResult"))
+                    {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("BigQuery job failed")
+                            .to_string();
+                        let _ = tx.send(Err(Error::Internal(msg))).await;
+                        return;
+                    }
+                    response_body
+                } else {
+                    // Inline polling loop (avoids &self borrow).
+                    let deadline = Instant::now() + crate::DATASOURCE_TIMEOUT_QUERY;
+                    loop {
+                        if Instant::now() > deadline {
+                            let _ = tx
+                                .send(Err(Error::Internal(
+                                    "BigQuery job polling timed out".into(),
+                                )))
+                                .await;
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                        let mut poll_url = format!(
+                            "{BIGQUERY_API_BASE}/projects/{billing_project}/jobs/{job_id}"
+                        );
+                        if !location.is_empty() {
+                            poll_url.push_str(&format!("?location={location}"));
+                        }
+
+                        let poll_resp = match client
+                            .get(&poll_url)
+                            .bearer_auth(&access_token)
+                            .send()
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(Error::Internal(format!(
+                                        "BigQuery poll failed: {e}"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let poll_body: serde_json::Value = match poll_resp.json().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(Error::Internal(format!(
+                                        "Failed to parse BigQuery poll response: {e}"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let state = poll_body
+                            .get("status")
+                            .and_then(|s| s.get("state"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+
+                        if state == "DONE" {
+                            if let Some(err) =
+                                poll_body.get("status").and_then(|s| s.get("errorResult"))
+                            {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("BigQuery job failed")
+                                    .to_string();
+                                let _ = tx.send(Err(Error::Internal(msg))).await;
+                                return;
+                            }
+                            break poll_body;
+                        }
+                    }
+                };
+
+                // Extract bytes_processed from job statistics.
+                let bytes_processed = completed_body
+                    .get("statistics")
+                    .and_then(|s| s.get("query"))
+                    .and_then(|q| q.get("totalBytesProcessed"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .or_else(|| v.as_i64())
+                    });
+
+                (job_id, location, (completed_body, bytes_processed))
+            };
+
+            let (job_body, bytes_processed) = job_body;
+
+            // Paginate through results using startIndex/maxResults.
+            let mut offset: u64 = 0;
+            let mut columns: Vec<crate::provider::ColumnInfo> = Vec::new();
+            let mut schema_sent = false;
+            let mut chunk_index: u32 = 0;
+            let mut total_rows_returned: u64 = 0;
+
+            loop {
+                let mut url = format!(
+                    "{BIGQUERY_API_BASE}/projects/{billing_project}/queries/{job_id}?maxResults={page_size}&startIndex={offset}",
+                );
+                if !location.is_empty() {
+                    url.push_str(&format!("&location={location}"));
+                }
+
+                let resp = match client.get(&url).bearer_auth(&access_token).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "BigQuery results fetch failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let status_code = resp.status();
+                let mut page: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "Failed to parse BigQuery results page: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                if status_code.is_client_error() || status_code.is_server_error() {
+                    let msg = extract_bigquery_error(&page);
+                    let _ = tx.send(Err(Error::Internal(msg))).await;
+                    return;
+                }
+
+                // Merge statistics on first page.
+                if !schema_sent
+                    && let Some(stats) = job_body.get("statistics")
+                {
+                    page["statistics"] = stats.clone();
+                }
+
+                // Extract/validate schema from this page.
+                let page_columns: Vec<crate::provider::ColumnInfo> = page
+                    .get("schema")
+                    .and_then(|s| s.get("fields"))
+                    .and_then(|f| f.as_array())
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .map(|field| {
+                                let name = field
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let type_name =
+                                    field.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                crate::provider::ColumnInfo {
+                                    name,
+                                    col_type: crate::type_mapping::map_bigquery_type(type_name),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let raw_rows = page
+                    .get("rows")
+                    .and_then(|r| r.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                if !schema_sent {
+                    // First page — establish schema and send Schema event.
+                    columns = page_columns;
+                    let builder = ArrowResultBuilder::new(&columns);
+                    let schema_ipc =
+                        match super::sqlx_common::schema_to_ipc_bytes(builder.schema()) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(Error::Internal(format!(
+                                        "Arrow schema serialization error: {e}"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                    if tx
+                        .send(Ok(ArrowStreamEvent::Schema {
+                            schema_ipc,
+                            columns: columns.clone(),
+                            total_rows: None,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    schema_sent = true;
+                } else if page_columns.len() != columns.len() {
+                    // Schema changed between pages — this should never happen for BQ.
+                    let _ = tx
+                        .send(Err(Error::Internal(
+                            "BigQuery schema changed between result pages".into(),
+                        )))
+                        .await;
+                    return;
+                }
+
+                let rows_in_page = raw_rows.len();
+
+                if rows_in_page > 0 {
+                    let mut builder = ArrowResultBuilder::new(&columns);
+                    for bq_row in &raw_rows {
+                        bigquery_row_to_arrow(bq_row, &columns, &mut builder);
+                    }
+                    match builder.finish_to_ipc() {
+                        Ok(ipc_bytes) => {
+                            if tx
+                                .send(Ok(ArrowStreamEvent::Batch {
+                                    ipc_bytes,
+                                    chunk_index,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            chunk_index += 1;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow IPC serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                    total_rows_returned += rows_in_page as u64;
+                    offset += rows_in_page as u64;
+                }
+
+                // BigQuery returns a pageToken when more rows exist beyond this page.
+                // Guard: if zero rows but pageToken present (non-standard), break to
+                // avoid spinning on the same startIndex.
+                let has_more = rows_in_page > 0
+                    && page
+                        .get("pageToken")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|s| !s.is_empty());
+
+                if !has_more {
+                    break;
+                }
+            }
+
+            // If schema was never sent (zero rows), send an empty schema.
+            if !schema_sent {
+                let empty_builder = ArrowResultBuilder::new(&[]);
+                let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(empty_builder.schema()) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "Arrow schema serialization error: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                let _ = tx
+                    .send(Ok(ArrowStreamEvent::Schema {
+                        schema_ipc,
+                        columns: Vec::new(),
+                        total_rows: None,
+                    }))
+                    .await;
+            }
+
+            let execution_time_ms = start.elapsed().as_millis() as i64;
+            let _ = tx
+                .send(Ok(ArrowStreamEvent::Complete {
+                    execution_time_ms: Some(execution_time_ms),
+                    bytes_processed,
+                    total_chunks: chunk_index,
+                    total_rows_returned,
+                }))
+                .await;
+        });
+
+        Ok(stream)
+    }
+
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {
         match self.run_query(sql, None, None, true).await {
             Ok(result) => {

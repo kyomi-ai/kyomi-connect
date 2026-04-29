@@ -293,6 +293,252 @@ fn tds_row_to_arrow_at(
 // Shared query execution helpers
 // ---------------------------------------------------------------------------
 
+/// Stream query results via the tiberius client as Arrow IPC batches.
+///
+/// This is the Arrow streaming implementation shared by SQL Server and Synapse.
+///
+/// # Why everything happens inside the spawn
+///
+/// `tiberius::QueryStream` borrows the locked `MutexGuard` that was used to
+/// call `simple_query`, so it is not `Send`. The entire row-processing loop
+/// must therefore run while holding that lock, inside the `tokio::spawn` task.
+/// The mpsc channel lets us push `ArrowStreamEvent` values out to the caller
+/// without moving the non-Send stream across threads.
+///
+/// # Pagination
+///
+/// Applies T-SQL pagination (OFFSET-FETCH or ROW_NUMBER wrapper) only for
+/// SELECT/WITH queries that have no existing OFFSET or TOP clause. The
+/// `_row_num` sentinel column added by ROW_NUMBER pagination is stripped from
+/// the schema and from every row.
+///
+/// # Arguments
+///
+/// * `client` — `Arc<Mutex<TdsClient>>` cloned from the provider.
+/// * `sql` — Raw SQL string (may have trailing semicolons).
+/// * `limit` — Optional page size; defaults to 10 000 when streaming.
+/// * `offset` — Optional row offset.
+/// * `chunk_size` — Target rows per emitted Arrow batch (`None` → 10 000).
+/// * `provider_name` — Display name used in error messages ("SQL Server" / "Azure Synapse").
+pub(crate) async fn execute_tds_stream_arrow(
+    client: std::sync::Arc<tokio::sync::Mutex<TdsClient>>,
+    sql: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    chunk_size: Option<u32>,
+    provider_name: &'static str,
+) -> kyomi_connect_protocol::ArrowStream {
+    use crate::arrow_builder::ArrowResultBuilder;
+    use crate::provider::ColumnInfo;
+    use kyomi_connect_protocol::{ArrowStreamEvent, Error};
+
+    tracing::debug!(
+        sql = %sql.chars().take(200).collect::<String>(),
+        provider = provider_name,
+        "{provider_name}: starting Arrow stream"
+    );
+
+    let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let effective_chunk_size = chunk_size.unwrap_or(10_000) as usize;
+
+        let sql_stripped = sql.trim().trim_end_matches(';').trim().to_string();
+        let sql_upper = sql_stripped.to_uppercase();
+        let is_select = sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH");
+
+        let effective_limit = limit.unwrap_or(10_000);
+        let effective_offset = offset.unwrap_or(0);
+
+        let paginated_sql =
+            if is_select && !sql_upper.contains("OFFSET") && !sql_upper.contains("TOP") {
+                apply_tsql_pagination(&sql_stripped, effective_limit, effective_offset)
+            } else {
+                sql_stripped.clone()
+            };
+
+        // Acquire the mutex and collect all rows while holding it.
+        //
+        // tiberius QueryStream is not Send — it borrows the &mut TdsClient
+        // obtained from the MutexGuard. We therefore do all I/O (query +
+        // row collection) inside a single async block while the guard is live,
+        // then return the owned Vec<Row> and let the guard drop at the end of
+        // that block.
+        let rows_result: Result<Vec<tiberius::Row>, String> = async {
+            let mut guard = client.lock().await;
+
+            let query_result = tokio::time::timeout(
+                crate::DATASOURCE_TIMEOUT_QUERY,
+                guard.simple_query(&paginated_sql),
+            )
+            .await;
+
+            let query_stream = match query_result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(format!("{provider_name} query error: {e}")),
+                Err(_) => {
+                    return Err(format!(
+                        "{provider_name} query timed out after {}s",
+                        crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                    ))
+                }
+            };
+
+            query_stream
+                .into_first_result()
+                .await
+                .map_err(|e| format!("{provider_name} result collection error: {e}"))
+            // `guard` drops here, releasing the mutex
+        }
+        .await;
+
+        let rows_result = match rows_result {
+            Ok(rows) => rows,
+            Err(msg) => {
+                let _ = tx.send(Err(Error::Internal(msg))).await;
+                return;
+            }
+        };
+
+        // Build column metadata from the first row
+        let columns: Vec<ColumnInfo> = if let Some(first_row) = rows_result.first() {
+            first_row
+                .columns()
+                .iter()
+                .map(|col| ColumnInfo {
+                    name: col.name().to_string(),
+                    col_type: map_column_type(col.column_type()),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Identify and strip the _row_num sentinel column added by ROW_NUMBER pagination
+        let row_num_idx = columns.iter().position(|c| c.name == "_row_num");
+        let filtered_columns: Vec<ColumnInfo> = if let Some(idx) = row_num_idx {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, c)| c.clone())
+                .collect()
+        } else {
+            columns
+        };
+
+        // Send Schema event
+        let mut arrow_builder = ArrowResultBuilder::new(&filtered_columns);
+        let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(arrow_builder.schema()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(Error::Internal(format!(
+                        "Arrow schema serialization error: {e}"
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        if tx
+            .send(Ok(ArrowStreamEvent::Schema {
+                schema_ipc,
+                columns: filtered_columns.clone(),
+                total_rows: None,
+            }))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        // Process rows into Arrow batches
+        let mut chunk_index: u32 = 0;
+        let mut total_rows_returned: u64 = 0;
+
+        for row in &rows_result {
+            for (i, col_info) in filtered_columns.iter().enumerate() {
+                let actual_idx = match row_num_idx {
+                    Some(rn_idx) if i >= rn_idx => i + 1,
+                    _ => i,
+                };
+                tds_row_to_arrow_at(row, i, actual_idx, col_info.col_type, &mut arrow_builder);
+            }
+            arrow_builder.finish_row();
+            total_rows_returned += 1;
+
+            if arrow_builder.row_count() >= effective_chunk_size {
+                let full_builder =
+                    std::mem::replace(&mut arrow_builder, ArrowResultBuilder::new(&filtered_columns));
+                match full_builder.finish_to_ipc() {
+                    Ok(ipc_bytes) => {
+                        if tx
+                            .send(Ok(ArrowStreamEvent::Batch {
+                                ipc_bytes,
+                                chunk_index,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        chunk_index += 1;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Error::Internal(format!(
+                                "Arrow IPC serialization error: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Flush remaining rows
+        if arrow_builder.row_count() > 0 {
+            match arrow_builder.finish_to_ipc() {
+                Ok(ipc_bytes) => {
+                    if tx
+                        .send(Ok(ArrowStreamEvent::Batch {
+                            ipc_bytes,
+                            chunk_index,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    chunk_index += 1;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Error::Internal(format!(
+                            "Arrow IPC serialization error: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let execution_time_ms = start.elapsed().as_millis() as i64;
+        let _ = tx
+            .send(Ok(ArrowStreamEvent::Complete {
+                execution_time_ms: Some(execution_time_ms),
+                bytes_processed: None,
+                total_chunks: chunk_index,
+                total_rows_returned,
+            }))
+            .await;
+    });
+
+    stream
+}
+
 /// Execute a query via the tiberius client and build a [`QueryResult`].
 ///
 /// This is the shared implementation for both SQL Server and Synapse providers.
