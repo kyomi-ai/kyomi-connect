@@ -1,6 +1,6 @@
 //! Streaming query types shared across all crates.
 //!
-//! Defines the universal streaming currency: [`QueryStreamEvent`] flows from
+//! Defines the Arrow streaming currency: [`ArrowStreamEvent`] flows from
 //! providers -> Connect wire protocol -> browser WebSocket.
 //!
 //! [`ColumnInfo`] and [`SimpleType`] are the canonical definitions -- downstream
@@ -102,62 +102,6 @@ pub struct ColumnInfo {
 }
 
 // ---------------------------------------------------------------------------
-// QueryStreamEvent -- the universal streaming currency
-// ---------------------------------------------------------------------------
-
-/// A single event in a streaming query result.
-///
-/// Every query result -- whether from a direct provider, Connect wire protocol,
-/// or browser WebSocket -- is expressed as a sequence of these events:
-///
-/// `Header` -> `Chunk`* -> `Complete`
-///
-/// For small results (< 1000 rows), there is exactly one `Chunk`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum QueryStreamEvent {
-    /// First event: column metadata and optional row count estimate.
-    Header {
-        /// Column definitions for the result set.
-        columns: Vec<ColumnInfo>,
-        /// Estimated total row count, if available. `None` when unknown.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        total_rows: Option<i64>,
-    },
-    /// One batch of rows. Sent one or more times between Header and Complete.
-    Chunk {
-        /// Row data -- each row is a list of JSON values matching column order.
-        rows: Vec<Vec<serde_json::Value>>,
-        /// Zero-based chunk index for ordering verification.
-        chunk_index: u32,
-    },
-    /// Final event: summary statistics. Signals end of stream.
-    Complete {
-        /// Wall-clock execution time in milliseconds.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        execution_time_ms: Option<i64>,
-        /// Bytes processed by the query engine (BigQuery, Snowflake, etc.).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bytes_processed: Option<i64>,
-        /// Number of chunks sent (for verification).
-        total_chunks: u32,
-        /// Total rows across all chunks.
-        total_rows_returned: u64,
-    },
-}
-
-// ---------------------------------------------------------------------------
-// QueryStream -- the stream type alias
-// ---------------------------------------------------------------------------
-
-/// A stream of [`QueryStreamEvent`]s.
-///
-/// This is the return type of `execute_query_stream` on `DatasourceProvider`.
-/// Each provider yields `Header` -> `Chunk`* -> `Complete` events.
-pub type QueryStream =
-    Pin<Box<dyn futures_util::Stream<Item = crate::Result<QueryStreamEvent>> + Send>>;
-
-// ---------------------------------------------------------------------------
 // QueryFormat -- requested result format
 // ---------------------------------------------------------------------------
 
@@ -201,7 +145,7 @@ pub(crate) mod base64_bytes {
 /// A streaming event carrying Arrow IPC binary data instead of JSON rows.
 ///
 /// Used when the client requests Arrow format via [`QueryFormat::Arrow`].
-/// The flow mirrors [`QueryStreamEvent`]:
+/// The flow is:
 ///
 /// `Schema` -> `Batch`* -> `Complete`
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,172 +291,6 @@ mod tests {
         let parsed: ColumnInfo = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.name, "created_at");
         assert_eq!(parsed.col_type, SimpleType::TimestampTz);
-    }
-
-    // -- QueryStreamEvent tests ----------------------------------------------
-
-    #[test]
-    fn header_event_serializes_correctly() {
-        let event = QueryStreamEvent::Header {
-            columns: vec![
-                ColumnInfo {
-                    name: "id".into(),
-                    col_type: SimpleType::Number,
-                },
-                ColumnInfo {
-                    name: "name".into(),
-                    col_type: SimpleType::String,
-                },
-            ],
-            total_rows: Some(42),
-        };
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["event"], "header");
-        assert_eq!(json["columns"][0]["name"], "id");
-        assert_eq!(json["columns"][0]["type"], "number");
-        assert_eq!(json["columns"][1]["name"], "name");
-        assert_eq!(json["total_rows"], 42);
-    }
-
-    #[test]
-    fn header_event_omits_null_total_rows() {
-        let event = QueryStreamEvent::Header {
-            columns: vec![],
-            total_rows: None,
-        };
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["event"], "header");
-        assert!(json.get("total_rows").is_none());
-    }
-
-    #[test]
-    fn chunk_event_serializes_correctly() {
-        let event = QueryStreamEvent::Chunk {
-            rows: vec![
-                vec![serde_json::json!(1), serde_json::json!("Alice")],
-                vec![serde_json::json!(2), serde_json::json!("Bob")],
-            ],
-            chunk_index: 0,
-        };
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["event"], "chunk");
-        assert_eq!(json["rows"][0][0], 1);
-        assert_eq!(json["rows"][0][1], "Alice");
-        assert_eq!(json["rows"][1][0], 2);
-        assert_eq!(json["chunk_index"], 0);
-    }
-
-    #[test]
-    fn complete_event_serializes_correctly() {
-        let event = QueryStreamEvent::Complete {
-            execution_time_ms: Some(123),
-            bytes_processed: Some(5_000_000),
-            total_chunks: 3,
-            total_rows_returned: 2500,
-        };
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["event"], "complete");
-        assert_eq!(json["execution_time_ms"], 123);
-        assert_eq!(json["bytes_processed"], 5_000_000);
-        assert_eq!(json["total_chunks"], 3);
-        assert_eq!(json["total_rows_returned"], 2500);
-    }
-
-    #[test]
-    fn complete_event_omits_null_optional_fields() {
-        let event = QueryStreamEvent::Complete {
-            execution_time_ms: None,
-            bytes_processed: None,
-            total_chunks: 1,
-            total_rows_returned: 10,
-        };
-        let json = serde_json::to_value(&event).expect("serialize");
-        assert_eq!(json["event"], "complete");
-        assert!(json.get("execution_time_ms").is_none());
-        assert!(json.get("bytes_processed").is_none());
-        assert_eq!(json["total_chunks"], 1);
-        assert_eq!(json["total_rows_returned"], 10);
-    }
-
-    #[test]
-    fn stream_event_roundtrip_header() {
-        let event = QueryStreamEvent::Header {
-            columns: vec![ColumnInfo {
-                name: "id".into(),
-                col_type: SimpleType::Number,
-            }],
-            total_rows: Some(100),
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        let parsed: QueryStreamEvent = serde_json::from_str(&json).expect("deserialize");
-        match parsed {
-            QueryStreamEvent::Header {
-                columns,
-                total_rows,
-            } => {
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "id");
-                assert_eq!(total_rows, Some(100));
-            }
-            _ => panic!("expected Header"),
-        }
-    }
-
-    #[test]
-    fn stream_event_roundtrip_chunk() {
-        let event = QueryStreamEvent::Chunk {
-            rows: vec![vec![serde_json::json!(42)]],
-            chunk_index: 7,
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        let parsed: QueryStreamEvent = serde_json::from_str(&json).expect("deserialize");
-        match parsed {
-            QueryStreamEvent::Chunk { rows, chunk_index } => {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][0], 42);
-                assert_eq!(chunk_index, 7);
-            }
-            _ => panic!("expected Chunk"),
-        }
-    }
-
-    #[test]
-    fn stream_event_roundtrip_complete() {
-        let event = QueryStreamEvent::Complete {
-            execution_time_ms: Some(999),
-            bytes_processed: None,
-            total_chunks: 5,
-            total_rows_returned: 4200,
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        let parsed: QueryStreamEvent = serde_json::from_str(&json).expect("deserialize");
-        match parsed {
-            QueryStreamEvent::Complete {
-                execution_time_ms,
-                bytes_processed,
-                total_chunks,
-                total_rows_returned,
-            } => {
-                assert_eq!(execution_time_ms, Some(999));
-                assert_eq!(bytes_processed, None);
-                assert_eq!(total_chunks, 5);
-                assert_eq!(total_rows_returned, 4200);
-            }
-            _ => panic!("expected Complete"),
-        }
-    }
-
-    #[test]
-    fn stream_event_deserializes_from_raw_json() {
-        let raw = r#"{"event":"chunk","rows":[[1,"x"],[2,"y"]],"chunk_index":0}"#;
-        let event: QueryStreamEvent = serde_json::from_str(raw).expect("deserialize");
-        match event {
-            QueryStreamEvent::Chunk { rows, chunk_index } => {
-                assert_eq!(rows.len(), 2);
-                assert_eq!(chunk_index, 0);
-            }
-            _ => panic!("expected Chunk"),
-        }
     }
 
     // -- QueryFormat tests ---------------------------------------------------

@@ -358,26 +358,6 @@ impl DatasourceProvider for SynapseProvider {
         }
     }
 
-    async fn execute_query_stream(
-        &self,
-        sql: &str,
-        limit: Option<u32>,
-        offset: Option<u32>,
-        include_total: bool,
-        chunk_size: Option<u32>,
-    ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::QueryStream> {
-        tsql_common::execute_tds_query_stream(
-            Arc::clone(&self.client),
-            sql,
-            limit,
-            offset,
-            include_total,
-            chunk_size,
-            "Azure Synapse",
-        )
-        .await
-    }
-
     async fn list_databases(&self) -> crate::provider::DiscoveryResult {
         // Synapse includes all databases (no system exclusion) — matches Python's
         // `super().list_databases(exclude_system=False)` override.
