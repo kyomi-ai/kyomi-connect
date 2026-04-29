@@ -563,6 +563,7 @@ impl DatasourceProvider for BigQueryProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
@@ -585,6 +586,7 @@ impl DatasourceProvider for BigQueryProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -686,6 +688,7 @@ impl DatasourceProvider for BigQueryProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
+            job_id: None,
         })
     }
 

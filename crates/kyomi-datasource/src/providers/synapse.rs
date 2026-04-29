@@ -303,6 +303,7 @@ impl DatasourceProvider for SynapseProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let mut client = self.client.lock().await;
         tsql_common::execute_tds_query(
@@ -369,6 +370,7 @@ impl DatasourceProvider for SynapseProvider {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         {
@@ -397,6 +399,7 @@ impl DatasourceProvider for SynapseProvider {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         {

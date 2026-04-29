@@ -214,6 +214,7 @@ impl DatasourceProvider for PostgresProvider {
         limit: Option<u32>,
         offset: Option<u32>,
         include_total: bool,
+        _job_id: Option<&str>,
     ) -> kyomi_connect_protocol::Result<QueryResult> {
         let start = Instant::now();
 
@@ -252,6 +253,7 @@ impl DatasourceProvider for PostgresProvider {
                     execution_time_ms: Some(start.elapsed().as_millis() as i64),
                     error: Some(e.to_string()),
                     record_batch: None,
+                    job_id: None,
                 });
             }
             Err(_) => {
@@ -268,6 +270,7 @@ impl DatasourceProvider for PostgresProvider {
                         crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
                     )),
                     record_batch: None,
+                    job_id: None,
                 });
             }
         };
@@ -326,6 +329,7 @@ impl DatasourceProvider for PostgresProvider {
             execution_time_ms: Some(execution_time_ms),
             error: None,
             record_batch,
+            job_id: None,
         })
     }
 
@@ -426,6 +430,7 @@ impl DatasourceProvider for PostgresProvider {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         {
@@ -450,6 +455,7 @@ impl DatasourceProvider for PostgresProvider {
                 None,
                 None,
                 false,
+                None,
             )
             .await
         {

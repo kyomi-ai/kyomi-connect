@@ -96,6 +96,7 @@ async fn postgres_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -106,6 +107,7 @@ async fn postgres_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -116,6 +118,7 @@ async fn postgres_arrow_timestamps() {
             Some(10),
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -190,6 +193,7 @@ async fn mysql_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -200,6 +204,7 @@ async fn mysql_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -210,6 +215,7 @@ async fn mysql_arrow_timestamps() {
             Some(10),
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -260,6 +266,7 @@ async fn clickhouse_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -270,6 +277,7 @@ async fn clickhouse_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -280,6 +288,7 @@ async fn clickhouse_arrow_timestamps() {
             Some(10),
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -346,6 +355,7 @@ async fn sqlserver_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -361,6 +371,7 @@ async fn sqlserver_arrow_timestamps() {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -371,6 +382,7 @@ async fn sqlserver_arrow_timestamps() {
             Some(10),
             None,
             false,
+            None,
         )
         .await
         .unwrap();
