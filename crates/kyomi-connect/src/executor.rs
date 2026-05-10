@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use arrow::array::Array;
 use futures_util::StreamExt;
 use kyomi_connect_protocol::ArrowStreamEvent;
 use kyomi_connect_protocol::stream::QueryFormat;
@@ -414,13 +415,10 @@ impl CommandExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list containers: {e}"))?;
 
-        let items = result
-            .rows
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(String::from))
-            .collect();
+        let items = kyomi_datasource::provider::extract_string_col_from_batch(
+            result.record_batch.as_ref(),
+            0,
+        );
 
         Ok(items)
     }
@@ -460,17 +458,29 @@ impl CommandExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list tables in '{container}': {e}"))?;
 
-        let items = result
-            .rows
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|row| {
-                let name = row.first().and_then(|v| v.as_str())?;
-                let table_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("TABLE");
-                Some((name.to_string(), table_type.to_string()))
-            })
-            .collect();
+        let items = if let Some(batch) = result.record_batch.as_ref() {
+            let names = batch.column(0).as_any()
+                .downcast_ref::<arrow::array::StringArray>();
+            let types = batch.column(1).as_any()
+                .downcast_ref::<arrow::array::StringArray>();
+            match (names, types) {
+                (Some(names), Some(types)) => (0..batch.num_rows())
+                    .filter_map(|i| {
+                        if names.is_null(i) { return None; }
+                        let name = names.value(i).to_string();
+                        let table_type = if types.is_null(i) {
+                            "TABLE".to_string()
+                        } else {
+                            types.value(i).to_string()
+                        };
+                        Some((name, table_type))
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        } else {
+            vec![]
+        };
 
         Ok(items)
     }
@@ -522,26 +532,37 @@ impl CommandExecutor {
                 anyhow::anyhow!("Failed to list columns for '{container}.{table_name}': {e}")
             })?;
 
-        let columns = result
-            .rows
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|row| {
-                let name = row.first().and_then(|v| v.as_str())?;
-                let native_type = row.get(1).and_then(|v| v.as_str()).unwrap_or("unknown");
-                let description = row
-                    .get(2)
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-                Some(CatalogColumn {
-                    name: name.to_string(),
-                    native_type: native_type.to_string(),
-                    description,
-                })
-            })
-            .collect();
+        let columns = if let Some(batch) = result.record_batch.as_ref() {
+            let names = batch.column(0).as_any()
+                .downcast_ref::<arrow::array::StringArray>();
+            let types = batch.column(1).as_any()
+                .downcast_ref::<arrow::array::StringArray>();
+            let descs = batch.column(2).as_any()
+                .downcast_ref::<arrow::array::StringArray>();
+            match (names, types, descs) {
+                (Some(names), Some(types), Some(descs)) => (0..batch.num_rows())
+                    .filter_map(|i| {
+                        if names.is_null(i) { return None; }
+                        let name = names.value(i).to_string();
+                        let native_type = if types.is_null(i) {
+                            "unknown".to_string()
+                        } else {
+                            types.value(i).to_string()
+                        };
+                        let description = if descs.is_null(i) {
+                            None
+                        } else {
+                            let s = descs.value(i);
+                            if s.is_empty() { None } else { Some(s.to_string()) }
+                        };
+                        Some(CatalogColumn { name, native_type, description })
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        } else {
+            vec![]
+        };
 
         Ok(columns)
     }

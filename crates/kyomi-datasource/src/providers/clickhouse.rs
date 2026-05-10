@@ -315,7 +315,6 @@ impl DatasourceProvider for ClickHouseProvider {
                 return Ok(QueryResult {
                     status: QueryStatus::Error,
                     columns: None,
-                    rows: None,
                     total_rows: None,
                     has_more: false,
                     bytes_processed: None,
@@ -348,7 +347,6 @@ impl DatasourceProvider for ClickHouseProvider {
             return Ok(QueryResult {
                 status: QueryStatus::Error,
                 columns: None,
-                rows: None,
                 total_rows: None,
                 has_more: false,
                 bytes_processed: None,
@@ -366,7 +364,6 @@ impl DatasourceProvider for ClickHouseProvider {
                 return Ok(QueryResult {
                     status: QueryStatus::Error,
                     columns: None,
-                    rows: None,
                     total_rows: None,
                     has_more: false,
                     bytes_processed: None,
@@ -474,7 +471,6 @@ impl DatasourceProvider for ClickHouseProvider {
         Ok(QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: None,
             total_rows,
             has_more,
             bytes_processed,

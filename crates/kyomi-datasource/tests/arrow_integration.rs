@@ -147,12 +147,6 @@ async fn postgres_arrow_timestamps() {
         );
     }
 
-    // Verify rows is None (not populated in Arrow-only mode)
-    assert!(
-        result.rows.is_none(),
-        "Postgres: rows should be None in Arrow-only mode"
-    );
-
     provider.close().await;
     println!(
         "Postgres: ✅ timestamps={}, dates={}, rows={}",
@@ -229,7 +223,6 @@ async fn mysql_arrow_timestamps() {
 
     assert_batch_has_timestamps(&batch, "ts");
     assert_batch_has_dates(&batch, "dt");
-    assert!(result.rows.is_none(), "MySQL: rows should be None");
 
     provider.close().await;
     println!("MySQL: ✅ timestamps correct, {} rows", batch.num_rows());
@@ -313,8 +306,6 @@ async fn clickhouse_arrow_timestamps() {
         );
     }
 
-    assert!(result.rows.is_none(), "ClickHouse: rows should be None");
-
     provider.close().await;
     println!(
         "ClickHouse: ✅ timestamps correct (non-null), {} rows",
@@ -396,8 +387,6 @@ async fn sqlserver_arrow_timestamps() {
 
     assert_batch_has_timestamps(&batch, "ts");
     assert_batch_has_dates(&batch, "dt");
-    assert!(result.rows.is_none(), "SQL Server: rows should be None");
-
     provider.close().await;
     println!(
         "SQL Server: ✅ timestamps correct, {} rows",

@@ -151,7 +151,6 @@ mod tests {
         QueryResult {
             status: QueryStatus::Success,
             columns: Some(columns),
-            rows: None,
             total_rows: Some(100),
             has_more: false,
             bytes_processed: Some(5_000_000),
@@ -227,7 +226,6 @@ mod tests {
         let result = QueryResult {
             status: QueryStatus::Success,
             columns: Some(vec![]),
-            rows: None,
             total_rows: None,
             has_more: false,
             bytes_processed: None,

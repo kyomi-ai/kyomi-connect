@@ -604,7 +604,6 @@ pub(crate) async fn execute_tds_query(
             return Ok(QueryResult {
                 status: QueryStatus::Error,
                 columns: None,
-                rows: None,
                 total_rows: None,
                 has_more: false,
                 bytes_processed: None,
@@ -618,7 +617,6 @@ pub(crate) async fn execute_tds_query(
             return Ok(QueryResult {
                 status: QueryStatus::Error,
                 columns: None,
-                rows: None,
                 total_rows: None,
                 has_more: false,
                 bytes_processed: None,
@@ -641,7 +639,6 @@ pub(crate) async fn execute_tds_query(
             return Ok(QueryResult {
                 status: QueryStatus::Error,
                 columns: None,
-                rows: None,
                 total_rows: None,
                 has_more: false,
                 bytes_processed: None,
@@ -728,7 +725,6 @@ pub(crate) async fn execute_tds_query(
     Ok(QueryResult {
         status: QueryStatus::Success,
         columns: Some(filtered_columns),
-        rows: None,
         total_rows,
         has_more,
         bytes_processed: None,

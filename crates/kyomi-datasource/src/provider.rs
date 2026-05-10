@@ -65,23 +65,19 @@ impl<'de> Deserialize<'de> for QueryStatus {
 
 /// Standard result format for query execution across all datasource providers.
 ///
-/// Uses row-based format for consistency with frontend expectations.
 /// Supports pagination with `total_rows` and `has_more` indicators.
 ///
 /// Wire-compatible with Python's `QueryResult` dataclass.
 ///
-/// In addition to the JSON `rows` field, `record_batch` carries the same data
-/// in Arrow columnar format for consumers that can use it directly (e.g., the
-/// Arrow-native export pipeline). The field is excluded from serialization
-/// because `RecordBatch` is not serde-serializable.
+/// Data is carried exclusively in `record_batch` (Arrow columnar format).
+/// The field is excluded from serialization because `RecordBatch` is not
+/// serde-serializable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     /// `"success"` or `"error"`.
     pub status: QueryStatus,
     /// Column metadata with types. `None` for error responses or dry-run.
     pub columns: Option<Vec<ColumnInfo>>,
-    /// Row-based data: each row is a list of JSON values. `None` for errors.
-    pub rows: Option<Vec<Vec<serde_json::Value>>>,
     /// Total result count (may be estimated). `None` if not requested or unavailable.
     pub total_rows: Option<i64>,
     /// Whether more pages are available beyond the current result set.
@@ -117,7 +113,6 @@ impl QueryResult {
         Self {
             status: QueryStatus::Success,
             columns: None,
-            rows: None,
             total_rows: None,
             has_more: false,
             bytes_processed: None,
@@ -134,7 +129,6 @@ impl QueryResult {
         Self {
             status: QueryStatus::Error,
             columns: None,
-            rows: None,
             total_rows: None,
             has_more: false,
             bytes_processed: None,
@@ -217,8 +211,7 @@ pub struct DiscoveryResult {
 ///
 /// Used by discovery methods (`list_databases`, `list_schemas`, etc.) that
 /// call `execute_query` and then need to read text values out of the result.
-/// Now that `execute_query` sets `rows: None`, callers must read from
-/// `record_batch` instead.
+/// All data is stored in `record_batch`; callers must read from there.
 ///
 /// Returns an empty `Vec` if the batch is `None` or the column index is out
 /// of range. Only works for `Utf8` (string) columns.
@@ -438,7 +431,6 @@ mod tests {
         assert_eq!(result.status, QueryStatus::Error);
         assert_eq!(result.error.as_deref(), Some("something went wrong"));
         assert!(result.columns.is_none());
-        assert!(result.rows.is_none());
         assert!(!result.has_more);
     }
 
@@ -448,7 +440,6 @@ mod tests {
         assert_eq!(result.status, QueryStatus::Success);
         assert!(result.error.is_none());
         assert!(result.columns.is_none());
-        assert!(result.rows.is_none());
         assert!(!result.has_more);
     }
 
@@ -466,10 +457,6 @@ mod tests {
                     col_type: SimpleType::String,
                 },
             ]),
-            rows: Some(vec![
-                vec![serde_json::json!(1), serde_json::json!("Alice")],
-                vec![serde_json::json!(2), serde_json::json!("Bob")],
-            ]),
             total_rows: Some(2),
             has_more: false,
             bytes_processed: Some(5_000_000),
@@ -483,8 +470,6 @@ mod tests {
         assert_eq!(json["columns"][0]["name"], "id");
         assert_eq!(json["columns"][0]["type"], "number");
         assert_eq!(json["columns"][1]["type"], "string");
-        assert_eq!(json["rows"][0][0], 1);
-        assert_eq!(json["rows"][0][1], "Alice");
         assert_eq!(json["total_rows"], 2);
         assert_eq!(json["has_more"], false);
         assert_eq!(json["bytes_processed"], 5_000_000);
