@@ -280,26 +280,23 @@ impl BigQueryProvider {
         sql: &str,
         dry_run: bool,
     ) -> Result<(String, String, Value), Error> {
-        let mut query_config = serde_json::json!({
+        // Use the jobs.query endpoint (POST /queries) instead of jobs.insert
+        // (POST /jobs). jobs.query accepts the bigquery.readonly OAuth scope,
+        // whereas jobs.insert requires the full bigquery scope.
+        let mut body = serde_json::json!({
             "query": sql,
             "useLegacySql": false,
         });
 
         if let Some(max_bytes) = &self.maximum_bytes_billed {
-            query_config["maximumBytesBilled"] = Value::String(max_bytes.clone());
+            body["maximumBytesBilled"] = Value::String(max_bytes.clone());
         }
 
         if dry_run {
-            query_config["dryRun"] = Value::Bool(true);
+            body["dryRun"] = Value::Bool(true);
         }
 
-        let body = serde_json::json!({
-            "configuration": {
-                "query": query_config,
-            }
-        });
-
-        let url = format!("{BIGQUERY_API_BASE}/projects/{}/jobs", self.billing_project);
+        let url = format!("{BIGQUERY_API_BASE}/projects/{}/queries", self.billing_project);
 
         let response = tokio::time::timeout(
             if dry_run {
@@ -777,16 +774,12 @@ impl DatasourceProvider for BigQueryProvider {
             // Submit the BigQuery job and wait for it to complete.
             let (job_id, location, job_body) = {
                 let body = serde_json::json!({
-                    "configuration": {
-                        "query": {
-                            "query": sql,
-                            "useLegacySql": false,
-                        },
-                    }
+                    "query": sql,
+                    "useLegacySql": false,
                 });
 
                 let url = format!(
-                    "{BIGQUERY_API_BASE}/projects/{billing_project}/jobs"
+                    "{BIGQUERY_API_BASE}/projects/{billing_project}/queries"
                 );
 
                 let resp = match tokio::time::timeout(
