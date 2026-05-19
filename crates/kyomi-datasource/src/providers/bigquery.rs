@@ -1186,6 +1186,13 @@ impl DatasourceProvider for BigQueryProvider {
                             .and_then(|s| s.parse::<i64>().ok())
                             .or_else(|| v.as_i64())
                     })
+                    .or_else(|| {
+                        result.get("totalBytesProcessed").and_then(|v| {
+                            v.as_str()
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .or_else(|| v.as_i64())
+                        })
+                    })
                     .unwrap_or(0);
 
                 let message = format!(
@@ -1585,6 +1592,114 @@ mod tests {
     #[test]
     fn format_bytes_zero() {
         assert_eq!(format_bytes(0), "0");
+    }
+
+    // --- dry_run bytes extraction ---
+
+    /// Verify that `totalBytesProcessed` at the top level of the QueryResponse
+    /// is extracted correctly.  The `jobs.query` API returns it there; the
+    /// `statistics.query` path is only populated for the Jobs API.
+    #[test]
+    fn dry_run_extracts_top_level_bytes_processed() {
+        // 1_000_000_000 bytes = exactly 1.00 GB under format_bytes' SI rounding.
+        let response = serde_json::json!({
+            "kind": "bigquery#queryResponse",
+            "schema": {},
+            "rows": [],
+            "totalBytesProcessed": "1000000000"
+        });
+
+        let bytes_processed = response
+            .get("statistics")
+            .and_then(|s| s.get("query"))
+            .and_then(|q| q.get("totalBytesProcessed"))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
+            .or_else(|| {
+                response.get("totalBytesProcessed").and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .or_else(|| v.as_i64())
+                })
+            })
+            .unwrap_or(0);
+
+        assert_eq!(bytes_processed, 1_000_000_000_i64);
+        assert_eq!(format_bytes(bytes_processed), "1.00 GB");
+
+        let message = format!(
+            "Query valid. Estimated {} bytes processed.",
+            format_bytes(bytes_processed)
+        );
+        assert!(
+            message.contains("1.00 GB"),
+            "Expected GB in message, got: {message}"
+        );
+    }
+
+    /// Verify that when only the statistics path is present, it is still used.
+    #[test]
+    fn dry_run_extracts_statistics_path_bytes_processed() {
+        let response = serde_json::json!({
+            "statistics": {
+                "query": {
+                    "totalBytesProcessed": "5000000"
+                }
+            }
+        });
+
+        let bytes_processed = response
+            .get("statistics")
+            .and_then(|s| s.get("query"))
+            .and_then(|q| q.get("totalBytesProcessed"))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
+            .or_else(|| {
+                response.get("totalBytesProcessed").and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .or_else(|| v.as_i64())
+                })
+            })
+            .unwrap_or(0);
+
+        assert_eq!(bytes_processed, 5_000_000_i64);
+        assert_eq!(format_bytes(bytes_processed), "5.0 MB");
+    }
+
+    /// Verify that when neither path is present, bytes_processed falls back to 0.
+    #[test]
+    fn dry_run_bytes_processed_defaults_to_zero() {
+        let response = serde_json::json!({
+            "kind": "bigquery#queryResponse",
+            "rows": []
+        });
+
+        let bytes_processed = response
+            .get("statistics")
+            .and_then(|s| s.get("query"))
+            .and_then(|q| q.get("totalBytesProcessed"))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| v.as_i64())
+            })
+            .or_else(|| {
+                response.get("totalBytesProcessed").and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .or_else(|| v.as_i64())
+                })
+            })
+            .unwrap_or(0);
+
+        assert_eq!(bytes_processed, 0_i64);
     }
 
     // --- bigquery_row_to_arrow ---
