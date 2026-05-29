@@ -156,7 +156,8 @@ pub async fn create_provider(
         feature = "databricks",
         feature = "sqlserver",
         feature = "synapse",
-        feature = "bigquery"
+        feature = "bigquery",
+        feature = "flaredb"
     ))]
     let resolved_credentials = resolve_shared_credentials(connection_config, credentials);
     #[cfg(not(any(
@@ -168,7 +169,8 @@ pub async fn create_provider(
         feature = "databricks",
         feature = "sqlserver",
         feature = "synapse",
-        feature = "bigquery"
+        feature = "bigquery",
+        feature = "flaredb"
     )))]
     let _ = (connection_config, credentials);
 
@@ -265,6 +267,16 @@ pub async fn create_provider(
         #[cfg(not(feature = "bigquery"))]
         DatasourceType::BigQuery => Err(kyomi_connect_protocol::Error::NotSupported(
             "BigQuery provider is not enabled (feature 'bigquery')".into(),
+        )),
+
+        // FlareDB — full implementation added in Task 2
+        #[cfg(feature = "flaredb")]
+        DatasourceType::FlareDb => Err(kyomi_connect_protocol::Error::NotSupported(
+            "FlareDB provider is not yet implemented".into(),
+        )),
+        #[cfg(not(feature = "flaredb"))]
+        DatasourceType::FlareDb => Err(kyomi_connect_protocol::Error::NotSupported(
+            "FlareDB provider is not enabled (feature 'flaredb')".into(),
         )),
     }
 }

@@ -53,6 +53,8 @@ percent-encoding = "2"
 
 # Arrow (columnar data format)
 arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-flight = { version = "57", default-features = false, features = ["flight-sql-experimental"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
 
 # Utilities
 anyhow = "1"

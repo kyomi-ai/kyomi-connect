@@ -53,3 +53,6 @@ pub mod synapse;
 
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
+
+#[cfg(feature = "flaredb")]
+pub mod flaredb;
