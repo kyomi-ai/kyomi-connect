@@ -1,9 +1,9 @@
 //! kyomi-datasource — Database provider implementations for Kyomi Connect.
 //!
 //! This crate contains the [`DatasourceProvider`] trait, result types, type
-//! mappings, and concrete provider implementations for all 9 supported
+//! mappings, and concrete provider implementations for all 10 supported
 //! datasource types (PostgreSQL, MySQL, Redshift, ClickHouse, Snowflake,
-//! Databricks, SQL Server, Azure Synapse, BigQuery).
+//! Databricks, SQL Server, Azure Synapse, BigQuery, FlareDB).
 //!
 //! Each provider can be independently enabled via Cargo feature flags.
 //!
@@ -38,7 +38,7 @@ pub use provider::{
     ColumnInfo, DatasourceProvider, DiscoveryResult, DryRunResult, QueryResult, QueryStatus,
     SimpleType,
 };
-pub use stream::query_result_to_arrow_stream;
+pub use stream::{make_arrow_stream_channel, query_result_to_arrow_stream};
 
 // ---------------------------------------------------------------------------
 // Timeout constants

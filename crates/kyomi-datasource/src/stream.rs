@@ -117,6 +117,29 @@ pub fn query_result_to_arrow_stream(
 }
 
 // ---------------------------------------------------------------------------
+// Arrow stream channel
+// ---------------------------------------------------------------------------
+
+/// Create an mpsc channel and convert the receiver into an [`ArrowStream`].
+///
+/// Returns `(tx, stream)` where `tx` is the sender to emit
+/// [`ArrowStreamEvent`]s and `stream` is the `ArrowStream` to return
+/// from `execute_query_stream_arrow`.
+pub fn make_arrow_stream_channel() -> (
+    tokio::sync::mpsc::Sender<kyomi_connect_protocol::Result<ArrowStreamEvent>>,
+    kyomi_connect_protocol::ArrowStream,
+) {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<kyomi_connect_protocol::Result<ArrowStreamEvent>>(4);
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+
+    (tx, Box::pin(stream))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

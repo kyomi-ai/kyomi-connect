@@ -26,6 +26,8 @@ use crate::provider::DatasourceProvider;
 
 #[cfg(feature = "bigquery")]
 use crate::providers::bigquery::BigQueryProvider;
+#[cfg(feature = "flaredb")]
+use crate::providers::flaredb::FlareDbProvider;
 #[cfg(feature = "clickhouse")]
 use crate::providers::clickhouse::ClickHouseProvider;
 #[cfg(feature = "databricks")]
@@ -269,11 +271,12 @@ pub async fn create_provider(
             "BigQuery provider is not enabled (feature 'bigquery')".into(),
         )),
 
-        // FlareDB — full implementation added in Task 2
         #[cfg(feature = "flaredb")]
-        DatasourceType::FlareDb => Err(kyomi_connect_protocol::Error::NotSupported(
-            "FlareDB provider is not yet implemented".into(),
-        )),
+        DatasourceType::FlareDb => {
+            let provider =
+                FlareDbProvider::new(connection_config, &resolved_credentials).await?;
+            Ok(Box::new(provider))
+        }
         #[cfg(not(feature = "flaredb"))]
         DatasourceType::FlareDb => Err(kyomi_connect_protocol::Error::NotSupported(
             "FlareDB provider is not enabled (feature 'flaredb')".into(),

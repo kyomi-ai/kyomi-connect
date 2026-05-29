@@ -134,21 +134,12 @@ pub(crate) fn schema_to_ipc_bytes(schema: &Schema) -> Result<Vec<u8>, arrow::err
 
 /// Create an mpsc channel and convert the receiver into an [`ArrowStream`].
 ///
-/// Returns `(tx, stream)` where `tx` is the sender to pass to
-/// [`drive_sqlx_stream_arrow`] and `stream` is the `ArrowStream` to return
-/// from `execute_query_stream_arrow`.
+/// Delegates to [`crate::stream::make_arrow_stream_channel`].
 pub(crate) fn make_arrow_stream_channel() -> (
     tokio::sync::mpsc::Sender<kyomi_connect_protocol::Result<ArrowStreamEvent>>,
     kyomi_connect_protocol::ArrowStream,
 ) {
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<kyomi_connect_protocol::Result<ArrowStreamEvent>>(4);
-
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-
-    (tx, Box::pin(stream))
+    crate::stream::make_arrow_stream_channel()
 }
 
 /// Drive a sqlx row stream through the Arrow Schema -> Batch* -> Complete
