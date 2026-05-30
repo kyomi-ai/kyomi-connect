@@ -26,6 +26,8 @@ use crate::provider::DatasourceProvider;
 
 #[cfg(feature = "bigquery")]
 use crate::providers::bigquery::BigQueryProvider;
+#[cfg(feature = "flaredb")]
+use crate::providers::flaredb::FlareDbProvider;
 #[cfg(feature = "clickhouse")]
 use crate::providers::clickhouse::ClickHouseProvider;
 #[cfg(feature = "databricks")]
@@ -156,7 +158,8 @@ pub async fn create_provider(
         feature = "databricks",
         feature = "sqlserver",
         feature = "synapse",
-        feature = "bigquery"
+        feature = "bigquery",
+        feature = "flaredb"
     ))]
     let resolved_credentials = resolve_shared_credentials(connection_config, credentials);
     #[cfg(not(any(
@@ -168,7 +171,8 @@ pub async fn create_provider(
         feature = "databricks",
         feature = "sqlserver",
         feature = "synapse",
-        feature = "bigquery"
+        feature = "bigquery",
+        feature = "flaredb"
     )))]
     let _ = (connection_config, credentials);
 
@@ -265,6 +269,17 @@ pub async fn create_provider(
         #[cfg(not(feature = "bigquery"))]
         DatasourceType::BigQuery => Err(kyomi_connect_protocol::Error::NotSupported(
             "BigQuery provider is not enabled (feature 'bigquery')".into(),
+        )),
+
+        #[cfg(feature = "flaredb")]
+        DatasourceType::FlareDb => {
+            let provider =
+                FlareDbProvider::new(connection_config, &resolved_credentials).await?;
+            Ok(Box::new(provider))
+        }
+        #[cfg(not(feature = "flaredb"))]
+        DatasourceType::FlareDb => Err(kyomi_connect_protocol::Error::NotSupported(
+            "FlareDB provider is not enabled (feature 'flaredb')".into(),
         )),
     }
 }

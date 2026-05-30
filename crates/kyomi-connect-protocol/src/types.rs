@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// All supported datasource types.
 ///
-/// The 9 variants match the canonical list used across the Kyomi platform.
+/// The 10 variants match the canonical list used across the Kyomi platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatasourceType {
     BigQuery,
@@ -26,10 +26,11 @@ pub enum DatasourceType {
     MySQL,
     SqlServer,
     Synapse,
+    FlareDb,
 }
 
 /// All variants in the canonical order.
-const ALL_TYPES: [DatasourceType; 9] = [
+const ALL_TYPES: [DatasourceType; 10] = [
     DatasourceType::BigQuery,
     DatasourceType::ClickHouse,
     DatasourceType::Snowflake,
@@ -39,6 +40,7 @@ const ALL_TYPES: [DatasourceType; 9] = [
     DatasourceType::MySQL,
     DatasourceType::SqlServer,
     DatasourceType::Synapse,
+    DatasourceType::FlareDb,
 ];
 
 impl DatasourceType {
@@ -54,6 +56,7 @@ impl DatasourceType {
             Self::MySQL => "mysql",
             Self::SqlServer => "sqlserver",
             Self::Synapse => "synapse",
+            Self::FlareDb => "flaredb",
         }
     }
 
@@ -69,6 +72,7 @@ impl DatasourceType {
             Self::MySQL => "MySQL",
             Self::SqlServer => "SQL Server",
             Self::Synapse => "Azure Synapse",
+            Self::FlareDb => "FlareDB",
         }
     }
 
@@ -84,6 +88,7 @@ impl DatasourceType {
             Self::MySQL => "MySQL database server",
             Self::SqlServer => "Microsoft SQL Server database",
             Self::Synapse => "Azure Synapse Analytics (SQL pools)",
+            Self::FlareDb => "FlareDB analytics database (Arrow Flight SQL)",
         }
     }
 
@@ -99,6 +104,7 @@ impl DatasourceType {
             Self::MySQL => Some(3306),
             Self::SqlServer => Some(1433),
             Self::Synapse => Some(1433),
+            Self::FlareDb => Some(8815),
         }
     }
 }
@@ -117,6 +123,7 @@ impl FromStr for DatasourceType {
             "mysql" => Ok(Self::MySQL),
             "sqlserver" => Ok(Self::SqlServer),
             "synapse" => Ok(Self::Synapse),
+            "flaredb" => Ok(Self::FlareDb),
             _ => Err(crate::Error::Internal(format!(
                 "unsupported datasource type: '{s}'. Must be one of: {}",
                 ALL_TYPES

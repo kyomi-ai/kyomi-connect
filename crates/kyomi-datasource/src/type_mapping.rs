@@ -438,6 +438,64 @@ pub fn map_redshift_type_code(code: u32) -> SimpleType {
 }
 
 // ---------------------------------------------------------------------------
+// Arrow DataType — direct mapping (used by Flight SQL providers)
+// ---------------------------------------------------------------------------
+
+/// Map an Arrow [`DataType`] to [`SimpleType`].
+///
+/// Used by providers that receive Arrow RecordBatches directly (e.g., FlareDB
+/// via Flight SQL). Since the data is already in Arrow format, the mapping is
+/// from Arrow types to the simplified column type system.
+pub fn map_arrow_type(dt: &arrow::datatypes::DataType) -> SimpleType {
+    use arrow::datatypes::DataType;
+    match dt {
+        // Boolean
+        DataType::Boolean => SimpleType::Boolean,
+
+        // Numeric types
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => SimpleType::Number,
+
+        // String types
+        DataType::Utf8 | DataType::LargeUtf8 => SimpleType::String,
+
+        // Date types
+        DataType::Date32 | DataType::Date64 => SimpleType::Date,
+
+        // Time types
+        DataType::Time32(_) | DataType::Time64(_) => SimpleType::Time,
+
+        // Timestamp without timezone
+        DataType::Timestamp(_, None) => SimpleType::Timestamp,
+
+        // Timestamp with timezone
+        DataType::Timestamp(_, Some(_)) => SimpleType::TimestampTz,
+
+        // Duration, Interval -> String representation
+        DataType::Duration(_) | DataType::Interval(_) => SimpleType::String,
+
+        // Binary types -> String
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            SimpleType::String
+        }
+
+        // Everything else (List, Struct, Map, Union, etc.) -> Unknown
+        _ => SimpleType::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -799,5 +857,96 @@ mod tests {
         assert_eq!(map_redshift_type_code(25), SimpleType::String);
         assert_eq!(map_redshift_type_code(1114), SimpleType::Timestamp);
         assert_eq!(map_redshift_type_code(1184), SimpleType::TimestampTz);
+    }
+
+    // --- Arrow DataType (Flight SQL) ---
+
+    #[test]
+    fn arrow_boolean() {
+        assert_eq!(
+            map_arrow_type(&arrow::datatypes::DataType::Boolean),
+            SimpleType::Boolean,
+        );
+    }
+
+    #[test]
+    fn arrow_numeric_types() {
+        use arrow::datatypes::DataType;
+        assert_eq!(map_arrow_type(&DataType::Int32), SimpleType::Number);
+        assert_eq!(map_arrow_type(&DataType::Int64), SimpleType::Number);
+        assert_eq!(map_arrow_type(&DataType::UInt64), SimpleType::Number);
+        assert_eq!(map_arrow_type(&DataType::Float64), SimpleType::Number);
+        assert_eq!(
+            map_arrow_type(&DataType::Decimal128(18, 2)),
+            SimpleType::Number,
+        );
+    }
+
+    #[test]
+    fn arrow_string_types() {
+        use arrow::datatypes::DataType;
+        assert_eq!(map_arrow_type(&DataType::Utf8), SimpleType::String);
+        assert_eq!(map_arrow_type(&DataType::LargeUtf8), SimpleType::String);
+    }
+
+    #[test]
+    fn arrow_date_and_time() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(map_arrow_type(&DataType::Date32), SimpleType::Date);
+        assert_eq!(map_arrow_type(&DataType::Date64), SimpleType::Date);
+        assert_eq!(
+            map_arrow_type(&DataType::Time32(TimeUnit::Millisecond)),
+            SimpleType::Time,
+        );
+        assert_eq!(
+            map_arrow_type(&DataType::Time64(TimeUnit::Microsecond)),
+            SimpleType::Time,
+        );
+    }
+
+    #[test]
+    fn arrow_timestamp_without_tz() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(
+            map_arrow_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            SimpleType::Timestamp,
+        );
+    }
+
+    #[test]
+    fn arrow_timestamp_with_tz() {
+        use std::sync::Arc;
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(
+            map_arrow_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(Arc::from("UTC")),
+            )),
+            SimpleType::TimestampTz,
+        );
+    }
+
+    #[test]
+    fn arrow_binary_types() {
+        use arrow::datatypes::DataType;
+        assert_eq!(map_arrow_type(&DataType::Binary), SimpleType::String);
+        assert_eq!(
+            map_arrow_type(&DataType::FixedSizeBinary(16)),
+            SimpleType::String,
+        );
+    }
+
+    #[test]
+    fn arrow_complex_types_map_to_unknown() {
+        use std::sync::Arc;
+        use arrow::datatypes::{DataType, Field};
+        assert_eq!(
+            map_arrow_type(&DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            )))),
+            SimpleType::Unknown,
+        );
     }
 }

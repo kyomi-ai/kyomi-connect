@@ -10,7 +10,7 @@ homepage = "https://kyomi.ai"
 [features]
 default = ["all"]
 all = ["postgres", "mysql", "redshift", "clickhouse", "snowflake",
-       "databricks", "sqlserver", "synapse", "bigquery"]
+       "databricks", "sqlserver", "synapse", "bigquery", "flaredb"]
 postgres = ["dep:sqlx"]
 mysql = ["dep:sqlx"]
 redshift = ["dep:sqlx", "postgres"]
@@ -20,6 +20,7 @@ databricks = []
 sqlserver = ["dep:tiberius", "dep:tokio-util"]
 synapse = ["dep:tiberius", "dep:tokio-util"]
 bigquery = ["dep:jsonwebtoken"]
+flaredb = ["dep:arrow-flight", "dep:tonic"]
 ssh = ["dep:russh"]
 
 [dependencies]
@@ -39,6 +40,8 @@ sqlx = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 
 # Auth (optional)
 jsonwebtoken = { workspace = true, optional = true }
