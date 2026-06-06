@@ -442,7 +442,13 @@ mod clickhouse_comparison {
     /// Drops the table first to avoid duplicate rows from parallel test execution.
     async fn setup_table(provider: &impl DatasourceProvider) {
         let _ = provider
-            .execute_query("DROP TABLE IF EXISTS comparison_test", None, None, false, None)
+            .execute_query(
+                "DROP TABLE IF EXISTS comparison_test",
+                None,
+                None,
+                false,
+                None,
+            )
             .await;
 
         provider
@@ -623,8 +629,14 @@ mod clickhouse_comparison {
         setup_table(&old).await;
 
         let sql = "SELECT id, name, value FROM comparison_test ORDER BY id";
-        let old_result = old.execute_query(sql, None, None, false, None).await.unwrap();
-        let new_result = new.execute_query(sql, None, None, false, None).await.unwrap();
+        let old_result = old
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
+        let new_result = new
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
 
         assert_batches_equivalent(&old_result, &new_result, "SELECT simple");
         assert_cell_values_match(
@@ -644,8 +656,14 @@ mod clickhouse_comparison {
         setup_table(&old).await;
 
         let sql = "SELECT id, name FROM comparison_test WHERE id > 1 ORDER BY id";
-        let old_result = old.execute_query(sql, None, None, false, None).await.unwrap();
-        let new_result = new.execute_query(sql, None, None, false, None).await.unwrap();
+        let old_result = old
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
+        let new_result = new
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
 
         assert_batches_equivalent(&old_result, &new_result, "SELECT with WHERE");
         assert_cell_values_match(
@@ -665,8 +683,14 @@ mod clickhouse_comparison {
         setup_table(&old).await;
 
         let sql = "SELECT name, count(*) as cnt, sum(value) as total FROM comparison_test GROUP BY name ORDER BY name";
-        let old_result = old.execute_query(sql, None, None, false, None).await.unwrap();
-        let new_result = new.execute_query(sql, None, None, false, None).await.unwrap();
+        let old_result = old
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
+        let new_result = new
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
 
         assert_batches_equivalent(&old_result, &new_result, "GROUP BY");
         assert_cell_values_match(
@@ -686,8 +710,14 @@ mod clickhouse_comparison {
         setup_table(&old).await;
 
         let sql = "SELECT count(*) as cnt, sum(value) as total FROM comparison_test";
-        let old_result = old.execute_query(sql, None, None, false, None).await.unwrap();
-        let new_result = new.execute_query(sql, None, None, false, None).await.unwrap();
+        let old_result = old
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
+        let new_result = new
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
 
         assert_batches_equivalent(&old_result, &new_result, "aggregation");
         assert_cell_values_match(
@@ -707,8 +737,14 @@ mod clickhouse_comparison {
         setup_table(&old).await;
 
         let sql = "SELECT id, value FROM comparison_test ORDER BY value DESC";
-        let old_result = old.execute_query(sql, None, None, false, None).await.unwrap();
-        let new_result = new.execute_query(sql, None, None, false, None).await.unwrap();
+        let old_result = old
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
+        let new_result = new
+            .execute_query(sql, None, None, false, None)
+            .await
+            .unwrap();
 
         assert_batches_equivalent(&old_result, &new_result, "ORDER BY DESC");
         assert_cell_values_match(
@@ -783,7 +819,10 @@ mod clickhouse_comparison {
         let result = new.dry_run("SELECT 1").await.unwrap();
         assert!(result.valid, "dry_run should validate SELECT 1");
 
-        let result = new.dry_run("SELECT * FROM comparison_test WHERE id = 1").await.unwrap();
+        let result = new
+            .dry_run("SELECT * FROM comparison_test WHERE id = 1")
+            .await
+            .unwrap();
         assert!(result.valid, "dry_run should validate SELECT with WHERE");
 
         let result = new.dry_run("SELCT 1").await.unwrap();
