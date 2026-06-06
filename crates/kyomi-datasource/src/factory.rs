@@ -28,8 +28,10 @@ use crate::provider::DatasourceProvider;
 use crate::providers::bigquery::BigQueryProvider;
 #[cfg(feature = "flaredb")]
 use crate::providers::flaredb::FlareDbProvider;
-#[cfg(feature = "clickhouse")]
+#[cfg(all(feature = "clickhouse", not(feature = "datafusion-providers")))]
 use crate::providers::clickhouse::ClickHouseProvider;
+#[cfg(feature = "datafusion-providers")]
+use crate::providers::clickhouse_datafusion::DataFusionClickHouseProvider;
 #[cfg(feature = "databricks")]
 use crate::providers::databricks::DatabricksProvider;
 #[cfg(feature = "mysql")]
@@ -154,6 +156,7 @@ pub async fn create_provider(
         feature = "mysql",
         feature = "redshift",
         feature = "clickhouse",
+        feature = "datafusion-providers",
         feature = "snowflake",
         feature = "databricks",
         feature = "sqlserver",
@@ -167,6 +170,7 @@ pub async fn create_provider(
         feature = "mysql",
         feature = "redshift",
         feature = "clickhouse",
+        feature = "datafusion-providers",
         feature = "snowflake",
         feature = "databricks",
         feature = "sqlserver",
@@ -207,15 +211,21 @@ pub async fn create_provider(
             "Redshift provider is not enabled (feature 'redshift')".into(),
         )),
 
-        #[cfg(feature = "clickhouse")]
+        #[cfg(feature = "datafusion-providers")]
+        DatasourceType::ClickHouse => {
+            let provider =
+                DataFusionClickHouseProvider::new(connection_config, &resolved_credentials).await?;
+            Ok(Box::new(provider))
+        }
+        #[cfg(all(feature = "clickhouse", not(feature = "datafusion-providers")))]
         DatasourceType::ClickHouse => {
             let provider =
                 ClickHouseProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
-        #[cfg(not(feature = "clickhouse"))]
+        #[cfg(not(any(feature = "clickhouse", feature = "datafusion-providers")))]
         DatasourceType::ClickHouse => Err(kyomi_connect_protocol::Error::NotSupported(
-            "ClickHouse provider is not enabled (feature 'clickhouse')".into(),
+            "ClickHouse provider is not enabled (feature 'clickhouse' or 'datafusion-providers')".into(),
         )),
 
         #[cfg(feature = "snowflake")]
