@@ -103,14 +103,10 @@ impl DatasourceProvider for FlareDbProvider {
         )
         .await
         .map_err(|_| {
-            kyomi_connect_protocol::Error::Internal(
-                "FlareDB test connection timed out".into(),
-            )
+            kyomi_connect_protocol::Error::Internal("FlareDB test connection timed out".into())
         })?
         .map_err(|e| {
-            kyomi_connect_protocol::Error::Internal(format!(
-                "FlareDB test connection failed: {e}"
-            ))
+            kyomi_connect_protocol::Error::Internal(format!("FlareDB test connection failed: {e}"))
         })?;
 
         // Consume the first endpoint to confirm data is accessible.
@@ -118,21 +114,18 @@ impl DatasourceProvider for FlareDbProvider {
             let Some(ticket) = endpoint.ticket else {
                 continue;
             };
-            tokio::time::timeout(
-                crate::DATASOURCE_TIMEOUT_CONNECT,
-                client.do_get(ticket),
-            )
-            .await
-            .map_err(|_| {
-                kyomi_connect_protocol::Error::Internal(
-                    "FlareDB test connection do_get timed out".into(),
-                )
-            })?
-            .map_err(|e| {
-                kyomi_connect_protocol::Error::Internal(format!(
-                    "FlareDB test connection do_get failed: {e}"
-                ))
-            })?;
+            tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, client.do_get(ticket))
+                .await
+                .map_err(|_| {
+                    kyomi_connect_protocol::Error::Internal(
+                        "FlareDB test connection do_get timed out".into(),
+                    )
+                })?
+                .map_err(|e| {
+                    kyomi_connect_protocol::Error::Internal(format!(
+                        "FlareDB test connection do_get failed: {e}"
+                    ))
+                })?;
             break;
         }
 
@@ -219,63 +212,59 @@ impl DatasourceProvider for FlareDbProvider {
                 continue;
             };
 
-            let stream = match tokio::time::timeout(
-                crate::DATASOURCE_TIMEOUT_QUERY,
-                client.do_get(ticket),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    return Ok(QueryResult {
-                        status: QueryStatus::Error,
-                        columns: None,
-                        total_rows: None,
-                        has_more: false,
-                        bytes_processed: None,
-                        execution_time_ms: Some(start.elapsed().as_millis() as i64),
-                        error: Some(format!("FlareDB do_get failed: {e}")),
-                        record_batch: None,
-                        job_id: None,
-                    });
-                }
-                Err(_) => {
-                    return Ok(QueryResult {
-                        status: QueryStatus::Error,
-                        columns: None,
-                        total_rows: None,
-                        has_more: false,
-                        bytes_processed: None,
-                        execution_time_ms: Some(start.elapsed().as_millis() as i64),
-                        error: Some(format!(
-                            "FlareDB do_get timed out after {}s",
-                            crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-                        )),
-                        record_batch: None,
-                        job_id: None,
-                    });
-                }
-            };
+            let stream =
+                match tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, client.do_get(ticket))
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        return Ok(QueryResult {
+                            status: QueryStatus::Error,
+                            columns: None,
+                            total_rows: None,
+                            has_more: false,
+                            bytes_processed: None,
+                            execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                            error: Some(format!("FlareDB do_get failed: {e}")),
+                            record_batch: None,
+                            job_id: None,
+                        });
+                    }
+                    Err(_) => {
+                        return Ok(QueryResult {
+                            status: QueryStatus::Error,
+                            columns: None,
+                            total_rows: None,
+                            has_more: false,
+                            bytes_processed: None,
+                            execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                            error: Some(format!(
+                                "FlareDB do_get timed out after {}s",
+                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                            )),
+                            record_batch: None,
+                            job_id: None,
+                        });
+                    }
+                };
 
-            let batches: Vec<arrow::record_batch::RecordBatch> = match stream
-                .try_collect::<Vec<_>>()
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    return Ok(QueryResult {
-                        status: QueryStatus::Error,
-                        columns: None,
-                        total_rows: None,
-                        has_more: false,
-                        bytes_processed: None,
-                        execution_time_ms: Some(start.elapsed().as_millis() as i64),
-                        error: Some(format!("FlareDB stream collect failed: {e}")),
-                        record_batch: None,
-                        job_id: None,
-                    });
-                }
-            };
+            let batches: Vec<arrow::record_batch::RecordBatch> =
+                match stream.try_collect::<Vec<_>>().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Ok(QueryResult {
+                            status: QueryStatus::Error,
+                            columns: None,
+                            total_rows: None,
+                            has_more: false,
+                            bytes_processed: None,
+                            execution_time_ms: Some(start.elapsed().as_millis() as i64),
+                            error: Some(format!("FlareDB stream collect failed: {e}")),
+                            record_batch: None,
+                            job_id: None,
+                        });
+                    }
+                };
 
             all_batches.extend(batches);
         }
@@ -455,9 +444,9 @@ impl DatasourceProvider for FlareDbProvider {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 let _ = tx
-                                    .send(Err(kyomi_connect_protocol::Error::Internal(
-                                        format!("Arrow schema serialization error: {e}"),
-                                    )))
+                                    .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                        "Arrow schema serialization error: {e}"
+                                    ))))
                                     .await;
                                 return;
                             }
@@ -593,10 +582,8 @@ impl DatasourceProvider for FlareDbProvider {
 
         match result {
             Ok(qr) => {
-                let items = crate::provider::extract_string_col_from_batch(
-                    qr.record_batch.as_ref(),
-                    0,
-                );
+                let items =
+                    crate::provider::extract_string_col_from_batch(qr.record_batch.as_ref(), 0);
                 DiscoveryResult { items, error: None }
             }
             Err(e) => DiscoveryResult {

@@ -650,20 +650,18 @@ impl DatasourceProvider for DatabricksProvider {
                     }
                     _ => {
                         // PENDING or RUNNING — poll.
-                        let statement_id = match initial_body
-                            .get("statement_id")
-                            .and_then(|id| id.as_str())
-                        {
-                            Some(id) => id.to_string(),
-                            None => {
-                                let _ = tx
-                                    .send(Err(kyomi_connect_protocol::Error::Internal(
-                                        "Databricks response missing statement_id".into(),
-                                    )))
-                                    .await;
-                                return;
-                            }
-                        };
+                        let statement_id =
+                            match initial_body.get("statement_id").and_then(|id| id.as_str()) {
+                                Some(id) => id.to_string(),
+                                None => {
+                                    let _ = tx
+                                        .send(Err(kyomi_connect_protocol::Error::Internal(
+                                            "Databricks response missing statement_id".into(),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                            };
 
                         let poll_url = format!(
                             "https://{server_hostname}/api/2.0/sql/statements/{statement_id}"
@@ -682,22 +680,18 @@ impl DatasourceProvider for DatabricksProvider {
 
                             tokio::time::sleep(STATEMENT_POLL_INTERVAL).await;
 
-                            let poll_resp = match client
-                                .get(&poll_url)
-                                .bearer_auth(&token)
-                                .send()
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(kyomi_connect_protocol::Error::Internal(
-                                            format!("Databricks poll failed: {e}"),
-                                        )))
-                                        .await;
-                                    return;
-                                }
-                            };
+                            let poll_resp =
+                                match client.get(&poll_url).bearer_auth(&token).send().await {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(kyomi_connect_protocol::Error::Internal(
+                                                format!("Databricks poll failed: {e}"),
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                };
 
                             let poll_body: serde_json::Value = match poll_resp.json().await {
                                 Ok(v) => v,
@@ -740,9 +734,7 @@ impl DatasourceProvider for DatabricksProvider {
                                 _ => {
                                     let _ = tx
                                         .send(Err(kyomi_connect_protocol::Error::Internal(
-                                            format!(
-                                                "Unexpected Databricks state: {poll_state}"
-                                            ),
+                                            format!("Unexpected Databricks state: {poll_state}"),
                                         )))
                                         .await;
                                     return;
@@ -995,7 +987,10 @@ impl DatasourceProvider for DatabricksProvider {
     }
 
     async fn list_catalogs(&self) -> crate::provider::DiscoveryResult {
-        match self.execute_query("SHOW CATALOGS", None, None, false, None).await {
+        match self
+            .execute_query("SHOW CATALOGS", None, None, false, None)
+            .await
+        {
             Ok(result) => {
                 let mut items: Vec<String> =
                     crate::provider::extract_string_col_from_batch(result.record_batch.as_ref(), 0)

@@ -381,7 +381,7 @@ pub(crate) async fn execute_tds_stream_arrow(
                     return Err(format!(
                         "{provider_name} query timed out after {}s",
                         crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-                    ))
+                    ));
                 }
             };
 
@@ -470,8 +470,10 @@ pub(crate) async fn execute_tds_stream_arrow(
             total_rows_returned += 1;
 
             if arrow_builder.row_count() >= effective_chunk_size {
-                let full_builder =
-                    std::mem::replace(&mut arrow_builder, ArrowResultBuilder::new(&filtered_columns));
+                let full_builder = std::mem::replace(
+                    &mut arrow_builder,
+                    ArrowResultBuilder::new(&filtered_columns),
+                );
                 match full_builder.finish_to_ipc() {
                     Ok(ipc_bytes) => {
                         if tx

@@ -327,7 +327,15 @@ impl DatasourceProvider for SynapseProvider {
     ) -> kyomi_connect_protocol::Result<kyomi_connect_protocol::ArrowStream> {
         let client = self.client.clone();
         let sql = sql.to_string();
-        Ok(tsql_common::execute_tds_stream_arrow(client, sql, limit, offset, chunk_size, "Azure Synapse").await)
+        Ok(tsql_common::execute_tds_stream_arrow(
+            client,
+            sql,
+            limit,
+            offset,
+            chunk_size,
+            "Azure Synapse",
+        )
+        .await)
     }
 
     async fn dry_run(&self, sql: &str) -> kyomi_connect_protocol::Result<DryRunResult> {

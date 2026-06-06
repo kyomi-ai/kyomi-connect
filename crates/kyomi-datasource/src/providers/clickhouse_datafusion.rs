@@ -110,15 +110,18 @@ impl DataFusionClickHouseProvider {
             .with_database(&database);
 
         // Verify connectivity during construction with timeout.
-        tokio::time::timeout(DATASOURCE_TIMEOUT_CONNECT, client.query("SELECT 1").execute())
-            .await
-            .map_err(|_| {
-                Error::Provider(format!(
-                    "ClickHouse connection timed out after {}s",
-                    DATASOURCE_TIMEOUT_CONNECT.as_secs()
-                ))
-            })?
-            .map_err(|e| Error::Provider(format!("ClickHouse connection failed: {e}")))?;
+        tokio::time::timeout(
+            DATASOURCE_TIMEOUT_CONNECT,
+            client.query("SELECT 1").execute(),
+        )
+        .await
+        .map_err(|_| {
+            Error::Provider(format!(
+                "ClickHouse connection timed out after {}s",
+                DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
+        .map_err(|e| Error::Provider(format!("ClickHouse connection failed: {e}")))?;
 
         Ok(Self { client })
     }
@@ -148,16 +151,13 @@ impl DataFusionClickHouseProvider {
             return Ok(Vec::new());
         }
 
-        let reader =
-            StreamReader::try_new(Cursor::new(collected.as_ref()), None).map_err(|e| {
-                Error::Provider(format!("Failed to parse Arrow IPC: {e}"))
-            })?;
+        let reader = StreamReader::try_new(Cursor::new(collected.as_ref()), None)
+            .map_err(|e| Error::Provider(format!("Failed to parse Arrow IPC: {e}")))?;
 
         let mut batches = Vec::new();
         for batch in reader {
-            let batch = batch.map_err(|e| {
-                Error::Provider(format!("Failed to read Arrow batch: {e}"))
-            })?;
+            let batch =
+                batch.map_err(|e| Error::Provider(format!("Failed to read Arrow batch: {e}")))?;
             batches.push(batch);
         }
 
@@ -219,10 +219,8 @@ impl DataFusionClickHouseProvider {
         }
 
         let schema = batches[0].schema();
-        let combined =
-            arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
-                Error::Provider(format!("Failed to combine RecordBatches: {e}"))
-            })?;
+        let combined = arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|e| Error::Provider(format!("Failed to combine RecordBatches: {e}")))?;
         Ok(Some(combined))
     }
 
@@ -278,9 +276,7 @@ impl DatasourceProvider for DataFusionClickHouseProvider {
         let batches = self.query_arrow(&sql_with_pagination).await?;
         let batch = Self::combine_batches(batches)?;
 
-        let columns = batch
-            .as_ref()
-            .map(|b| Self::schema_to_columns(&b.schema()));
+        let columns = batch.as_ref().map(|b| Self::schema_to_columns(&b.schema()));
 
         let row_count = batch.as_ref().map(|b| b.num_rows() as u64).unwrap_or(0);
 

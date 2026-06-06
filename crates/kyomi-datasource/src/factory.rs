@@ -26,14 +26,14 @@ use crate::provider::DatasourceProvider;
 
 #[cfg(feature = "bigquery")]
 use crate::providers::bigquery::BigQueryProvider;
-#[cfg(feature = "flaredb")]
-use crate::providers::flaredb::FlareDbProvider;
 #[cfg(all(feature = "clickhouse", not(feature = "datafusion-providers")))]
 use crate::providers::clickhouse::ClickHouseProvider;
 #[cfg(feature = "datafusion-providers")]
 use crate::providers::clickhouse_datafusion::DataFusionClickHouseProvider;
 #[cfg(feature = "databricks")]
 use crate::providers::databricks::DatabricksProvider;
+#[cfg(feature = "flaredb")]
+use crate::providers::flaredb::FlareDbProvider;
 #[cfg(feature = "mysql")]
 use crate::providers::mysql::MySqlProvider;
 #[cfg(feature = "postgres")]
@@ -225,7 +225,8 @@ pub async fn create_provider(
         }
         #[cfg(not(any(feature = "clickhouse", feature = "datafusion-providers")))]
         DatasourceType::ClickHouse => Err(kyomi_connect_protocol::Error::NotSupported(
-            "ClickHouse provider is not enabled (feature 'clickhouse' or 'datafusion-providers')".into(),
+            "ClickHouse provider is not enabled (feature 'clickhouse' or 'datafusion-providers')"
+                .into(),
         )),
 
         #[cfg(feature = "snowflake")]
@@ -283,8 +284,7 @@ pub async fn create_provider(
 
         #[cfg(feature = "flaredb")]
         DatasourceType::FlareDb => {
-            let provider =
-                FlareDbProvider::new(connection_config, &resolved_credentials).await?;
+            let provider = FlareDbProvider::new(connection_config, &resolved_credentials).await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "flaredb"))]
