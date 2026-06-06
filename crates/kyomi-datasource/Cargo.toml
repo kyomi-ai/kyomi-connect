@@ -22,6 +22,7 @@ synapse = ["dep:tiberius", "dep:tokio-util"]
 bigquery = ["dep:jsonwebtoken"]
 flaredb = ["dep:arrow-flight", "dep:tonic"]
 ssh = ["dep:russh"]
+datafusion-providers = ["dep:datafusion", "dep:clickhouse", "dep:arrow-ipc"]
 
 [dependencies]
 kyomi-connect-protocol = { workspace = true }
@@ -64,6 +65,11 @@ percent-encoding = { workspace = true }
 
 # Error parsing
 regex = { workspace = true }
+
+# DataFusion (optional, feature-gated)
+datafusion = { workspace = true, optional = true }
+clickhouse = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # HTTP mock server for testing OAuth token exchange
