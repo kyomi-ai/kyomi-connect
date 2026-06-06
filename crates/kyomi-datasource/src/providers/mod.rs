@@ -56,3 +56,6 @@ pub mod bigquery;
 
 #[cfg(feature = "flaredb")]
 pub mod flaredb;
+
+#[cfg(feature = "datafusion-providers")]
+pub mod clickhouse_datafusion;

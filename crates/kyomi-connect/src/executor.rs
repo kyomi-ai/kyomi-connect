@@ -459,14 +459,20 @@ impl CommandExecutor {
             .map_err(|e| anyhow::anyhow!("Failed to list tables in '{container}': {e}"))?;
 
         let items = if let Some(batch) = result.record_batch.as_ref() {
-            let names = batch.column(0).as_any()
+            let names = batch
+                .column(0)
+                .as_any()
                 .downcast_ref::<arrow::array::StringArray>();
-            let types = batch.column(1).as_any()
+            let types = batch
+                .column(1)
+                .as_any()
                 .downcast_ref::<arrow::array::StringArray>();
             match (names, types) {
                 (Some(names), Some(types)) => (0..batch.num_rows())
                     .filter_map(|i| {
-                        if names.is_null(i) { return None; }
+                        if names.is_null(i) {
+                            return None;
+                        }
                         let name = names.value(i).to_string();
                         let table_type = if types.is_null(i) {
                             "TABLE".to_string()
@@ -533,16 +539,24 @@ impl CommandExecutor {
             })?;
 
         let columns = if let Some(batch) = result.record_batch.as_ref() {
-            let names = batch.column(0).as_any()
+            let names = batch
+                .column(0)
+                .as_any()
                 .downcast_ref::<arrow::array::StringArray>();
-            let types = batch.column(1).as_any()
+            let types = batch
+                .column(1)
+                .as_any()
                 .downcast_ref::<arrow::array::StringArray>();
-            let descs = batch.column(2).as_any()
+            let descs = batch
+                .column(2)
+                .as_any()
                 .downcast_ref::<arrow::array::StringArray>();
             match (names, types, descs) {
                 (Some(names), Some(types), Some(descs)) => (0..batch.num_rows())
                     .filter_map(|i| {
-                        if names.is_null(i) { return None; }
+                        if names.is_null(i) {
+                            return None;
+                        }
                         let name = names.value(i).to_string();
                         let native_type = if types.is_null(i) {
                             "unknown".to_string()
@@ -553,9 +567,17 @@ impl CommandExecutor {
                             None
                         } else {
                             let s = descs.value(i);
-                            if s.is_empty() { None } else { Some(s.to_string()) }
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s.to_string())
+                            }
                         };
-                        Some(CatalogColumn { name, native_type, description })
+                        Some(CatalogColumn {
+                            name,
+                            native_type,
+                            description,
+                        })
                     })
                     .collect(),
                 _ => vec![],

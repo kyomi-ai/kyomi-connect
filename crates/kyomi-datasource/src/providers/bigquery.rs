@@ -296,7 +296,10 @@ impl BigQueryProvider {
             body["dryRun"] = Value::Bool(true);
         }
 
-        let url = format!("{BIGQUERY_API_BASE}/projects/{}/queries", self.billing_project);
+        let url = format!(
+            "{BIGQUERY_API_BASE}/projects/{}/queries",
+            self.billing_project
+        );
 
         let response = tokio::time::timeout(
             if dry_run {
@@ -778,9 +781,7 @@ impl DatasourceProvider for BigQueryProvider {
                     "useLegacySql": false,
                 });
 
-                let url = format!(
-                    "{BIGQUERY_API_BASE}/projects/{billing_project}/queries"
-                );
+                let url = format!("{BIGQUERY_API_BASE}/projects/{billing_project}/queries");
 
                 let resp = match tokio::time::timeout(
                     crate::DATASOURCE_TIMEOUT_QUERY,
@@ -890,9 +891,8 @@ impl DatasourceProvider for BigQueryProvider {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                        let mut poll_url = format!(
-                            "{BIGQUERY_API_BASE}/projects/{billing_project}/jobs/{job_id}"
-                        );
+                        let mut poll_url =
+                            format!("{BIGQUERY_API_BASE}/projects/{billing_project}/jobs/{job_id}");
                         if !location.is_empty() {
                             poll_url.push_str(&format!("?location={location}"));
                         }
@@ -1012,9 +1012,7 @@ impl DatasourceProvider for BigQueryProvider {
                 }
 
                 // Merge statistics on first page.
-                if !schema_sent
-                    && let Some(stats) = job_body.get("statistics")
-                {
+                if !schema_sent && let Some(stats) = job_body.get("statistics") {
                     page["statistics"] = stats.clone();
                 }
 
@@ -1053,18 +1051,18 @@ impl DatasourceProvider for BigQueryProvider {
                     // First page — establish schema and send Schema event.
                     columns = page_columns;
                     let builder = ArrowResultBuilder::new(&columns);
-                    let schema_ipc =
-                        match super::sqlx_common::schema_to_ipc_bytes(builder.schema()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(Error::Internal(format!(
-                                        "Arrow schema serialization error: {e}"
-                                    ))))
-                                    .await;
-                                return;
-                            }
-                        };
+                    let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(builder.schema())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
 
                     if tx
                         .send(Ok(ArrowStreamEvent::Schema {
@@ -1139,17 +1137,18 @@ impl DatasourceProvider for BigQueryProvider {
             // If schema was never sent (zero rows), send an empty schema.
             if !schema_sent {
                 let empty_builder = ArrowResultBuilder::new(&[]);
-                let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(empty_builder.schema()) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Error::Internal(format!(
-                                "Arrow schema serialization error: {e}"
-                            ))))
-                            .await;
-                        return;
-                    }
-                };
+                let schema_ipc =
+                    match super::sqlx_common::schema_to_ipc_bytes(empty_builder.schema()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
                 let _ = tx
                     .send(Ok(ArrowStreamEvent::Schema {
                         schema_ipc,

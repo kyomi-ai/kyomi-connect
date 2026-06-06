@@ -54,7 +54,12 @@ percent-encoding = "2"
 # Arrow (columnar data format)
 arrow = { version = "57", default-features = false, features = ["ipc"] }
 arrow-flight = { version = "57", default-features = false, features = ["flight-sql-experimental"] }
+arrow-ipc = { version = "57", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
+
+# DataFusion (universal query engine, optional for adapter pattern)
+datafusion = { version = "52", default-features = false, features = ["sql"] }
+clickhouse = { version = "0.13", default-features = false }
 
 # Utilities
 anyhow = "1"

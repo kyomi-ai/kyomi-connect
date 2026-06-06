@@ -593,8 +593,7 @@ impl DatasourceProvider for SnowflakeProvider {
                 .header("Accept", "application/json");
 
             if auth_type == AuthType::KeypairJwt {
-                request =
-                    request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+                request = request.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
             }
 
             let response = match tokio::time::timeout(
@@ -656,10 +655,7 @@ impl DatasourceProvider for SnowflakeProvider {
 
             let result_body = if code == "333334" {
                 // Async — need to poll.
-                let handle = match initial_body
-                    .get("statementHandle")
-                    .and_then(|h| h.as_str())
-                {
+                let handle = match initial_body.get("statementHandle").and_then(|h| h.as_str()) {
                     Some(h) => h.to_string(),
                     None => {
                         let _ = tx
@@ -686,11 +682,13 @@ impl DatasourceProvider for SnowflakeProvider {
 
                     tokio::time::sleep(STATEMENT_POLL_INTERVAL).await;
 
-                    let mut poll_req =
-                        client.get(&poll_url).bearer_auth(&token).header("Accept", "application/json");
+                    let mut poll_req = client
+                        .get(&poll_url)
+                        .bearer_auth(&token)
+                        .header("Accept", "application/json");
                     if auth_type == AuthType::KeypairJwt {
-                        poll_req = poll_req
-                            .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+                        poll_req =
+                            poll_req.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
                     }
 
                     let poll_resp = match tokio::time::timeout(
@@ -736,8 +734,10 @@ impl DatasourceProvider for SnowflakeProvider {
                         continue;
                     }
 
-                    let poll_status =
-                        poll_body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                    let poll_status = poll_body
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     if poll_status == "FAILED_WITH_ERROR" {
                         let msg = poll_body
                             .get("message")
@@ -898,35 +898,33 @@ impl DatasourceProvider for SnowflakeProvider {
                     .bearer_auth(&token)
                     .header("Accept", "application/json");
                 if auth_type == AuthType::KeypairJwt {
-                    part_req = part_req
-                        .header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
+                    part_req =
+                        part_req.header("X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT");
                 }
 
-                let part_resp = match tokio::time::timeout(
-                    crate::DATASOURCE_TIMEOUT_QUERY,
-                    part_req.send(),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        let _ = tx
-                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
-                                "Snowflake partition {partition_idx} fetch failed: {e}"
-                            ))))
-                            .await;
-                        return;
-                    }
-                    Err(_) => {
-                        let _ = tx
-                            .send(Err(kyomi_connect_protocol::Error::Internal(format!(
-                                "Snowflake partition {partition_idx} fetch timed out after {}s",
-                                crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
-                            ))))
-                            .await;
-                        return;
-                    }
-                };
+                let part_resp =
+                    match tokio::time::timeout(crate::DATASOURCE_TIMEOUT_QUERY, part_req.send())
+                        .await
+                    {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Snowflake partition {partition_idx} fetch failed: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Snowflake partition {partition_idx} fetch timed out after {}s",
+                                    crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
 
                 let status_code = part_resp.status();
                 let part_body: serde_json::Value = match part_resp.json().await {

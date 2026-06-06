@@ -915,8 +915,8 @@ mod tests {
 
     #[test]
     fn arrow_timestamp_with_tz() {
-        use std::sync::Arc;
         use arrow::datatypes::{DataType, TimeUnit};
+        use std::sync::Arc;
         assert_eq!(
             map_arrow_type(&DataType::Timestamp(
                 TimeUnit::Microsecond,
@@ -938,8 +938,8 @@ mod tests {
 
     #[test]
     fn arrow_complex_types_map_to_unknown() {
-        use std::sync::Arc;
         use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
         assert_eq!(
             map_arrow_type(&DataType::List(Arc::new(Field::new(
                 "item",

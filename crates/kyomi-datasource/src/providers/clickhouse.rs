@@ -505,8 +505,7 @@ impl DatasourceProvider for ClickHouseProvider {
         // Strip semicolons from the SQL — we'll append LIMIT/OFFSET for pagination.
         let sql_stripped = sql.trim().trim_end_matches(';').trim().to_string();
         let sql_upper = sql_stripped.to_uppercase();
-        let is_select =
-            sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH");
+        let is_select = sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH");
         let already_has_limit = sql_upper.contains("LIMIT");
 
         // Clone fields needed by the spawned task — &self cannot cross spawn.
@@ -627,7 +626,9 @@ impl DatasourceProvider for ClickHouseProvider {
                         data.iter()
                             .map(|row| {
                                 row.as_array()
-                                    .map(|arr| arr.iter().map(|v| sanitize_null_bytes(v.clone())).collect())
+                                    .map(|arr| {
+                                        arr.iter().map(|v| sanitize_null_bytes(v.clone())).collect()
+                                    })
                                     .unwrap_or_default()
                             })
                             .collect()
@@ -637,18 +638,18 @@ impl DatasourceProvider for ClickHouseProvider {
                 if !schema_sent {
                     columns = page_columns;
                     let builder = ArrowResultBuilder::new(&columns);
-                    let schema_ipc =
-                        match super::sqlx_common::schema_to_ipc_bytes(builder.schema()) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(kyomi_connect_protocol::Error::Internal(format!(
-                                        "Arrow schema serialization error: {e}"
-                                    ))))
-                                    .await;
-                                return;
-                            }
-                        };
+                    let schema_ipc = match super::sqlx_common::schema_to_ipc_bytes(builder.schema())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(kyomi_connect_protocol::Error::Internal(format!(
+                                    "Arrow schema serialization error: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
 
                     if tx
                         .send(Ok(ArrowStreamEvent::Schema {
