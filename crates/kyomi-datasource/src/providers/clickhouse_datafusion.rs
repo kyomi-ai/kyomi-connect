@@ -15,6 +15,11 @@
 //! | `port` | int | `8123` | HTTP port |
 //! | `database` | string | `"default"` | Default database |
 //! | `secure` | bool | `false` | Use HTTPS instead of HTTP |
+//! | `ssh_enabled` | bool | `false` | Whether to use SSH tunnel |
+//! | `ssh_host` | string | — | Bastion host for SSH tunnel |
+//! | `ssh_port` | int | `22` | SSH port |
+//! | `ssh_username` | string | — | SSH username |
+//! | `ssh_private_key` | string | — | PEM-encoded SSH private key |
 //!
 //! ## Credentials
 //!
@@ -40,6 +45,8 @@ use crate::provider::{
 use crate::{DATASOURCE_TIMEOUT_CONNECT, DATASOURCE_TIMEOUT_QUERY};
 
 use kyomi_connect_protocol::Error;
+#[cfg(feature = "ssh")]
+use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
 
 /// Default ClickHouse HTTP port.
 const DEFAULT_PORT: u16 = 8123;
@@ -55,6 +62,9 @@ const DEFAULT_USERNAME: &str = "default";
 pub struct DataFusionClickHouseProvider {
     /// ClickHouse client from the `clickhouse` crate.
     client: Client,
+    /// SSH tunnel, if configured. Held to keep the tunnel alive.
+    #[cfg(feature = "ssh")]
+    _ssh_tunnel: Option<SshTunnel>,
 }
 
 impl DataFusionClickHouseProvider {
@@ -68,12 +78,16 @@ impl DataFusionClickHouseProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
-        let host = connection_config
+        // When the `ssh` feature is enabled, these are reassigned to the tunnel endpoint.
+        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
+        let mut host = connection_config
             .get("host")
             .and_then(|v| v.as_str())
-            .unwrap_or("localhost");
+            .unwrap_or("localhost")
+            .to_string();
 
-        let port = connection_config
+        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
+        let mut port = connection_config
             .get("port")
             .and_then(|v| v.as_u64())
             .map(|p| p as u16)
@@ -100,7 +114,36 @@ impl DataFusionClickHouseProvider {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let scheme = if secure { "https" } else { "http" };
+        // SSH tunnel setup
+        #[cfg(feature = "ssh")]
+        let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
+            Some(Ok(ssh_config)) => {
+                let tunnel = SshTunnel::connect(
+                    &ssh_config.host,
+                    ssh_config.port,
+                    &ssh_config.username,
+                    &ssh_config.private_key,
+                    &host,
+                    port,
+                )
+                .await?;
+
+                let (tunnel_host, tunnel_port) = tunnel.local_addr();
+                host = tunnel_host.to_string();
+                port = tunnel_port;
+
+                Some(tunnel)
+            }
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
+
+        // When using SSH tunnel, disable SSL (tunnel provides encryption)
+        #[cfg(feature = "ssh")]
+        let effective_secure = if ssh_tunnel.is_some() { false } else { secure };
+        #[cfg(not(feature = "ssh"))]
+        let effective_secure = secure;
+        let scheme = if effective_secure { "https" } else { "http" };
         let url = format!("{scheme}://{host}:{port}");
 
         let client = Client::default()
@@ -123,7 +166,11 @@ impl DataFusionClickHouseProvider {
         })?
         .map_err(|e| Error::Provider(format!("ClickHouse connection failed: {e}")))?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(feature = "ssh")]
+            _ssh_tunnel: ssh_tunnel,
+        })
     }
 
     /// Execute a raw SQL query and return the result as Arrow RecordBatches.
