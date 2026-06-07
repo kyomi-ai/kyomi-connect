@@ -44,9 +44,9 @@ use crate::provider::{
 };
 use crate::{DATASOURCE_TIMEOUT_CONNECT, DATASOURCE_TIMEOUT_QUERY};
 
-use kyomi_connect_protocol::Error;
 #[cfg(feature = "ssh")]
 use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
+use kyomi_connect_protocol::Error;
 
 /// Default ClickHouse HTTP port.
 const DEFAULT_PORT: u16 = 8123;
