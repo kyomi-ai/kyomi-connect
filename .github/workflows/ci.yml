@@ -53,6 +53,9 @@ jobs:
           - databricks
           - synapse
           - redshift
+          - postgres,ssh
+          - datafusion-providers,ssh
+          - all
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
