@@ -32,8 +32,17 @@ rsa = { version = "0.9", features = ["pkcs5"] }
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
 
-# SSH tunneling
-russh = "0.57"
+# SSH tunneling.
+# Pinned to 0.54.x deliberately — do NOT bump to >=0.55 without checking the
+# downstream `kyomi` app. russh 0.55 switched its crypto stack to the
+# pre-release RustCrypto generation (generic-array 1.x, rsa 0.10-rc), which is
+# mutually unsatisfiable with `webauthn-rs`/`crypto-glue` (generic-array
+# =0.14.7, rsa 0.9) that kyomi pulls in for passkeys — so >=0.55 makes the
+# `ssh` feature un-resolvable in kyomi's binary (direct-path SSH tunnel).
+# 0.54.x still uses the stable generation and coexists. (0.54.6 is skipped
+# automatically — it has a yanked libcrux-ml-kem dep; cargo resolves 0.54.5.)
+# Revisit when crypto-glue moves to the stable rsa 0.10 / generic-array 1.x.
+russh = "0.54"
 
 # Type support
 rust_decimal = { version = "1", features = ["serde-with-str"] }
@@ -73,7 +82,7 @@ http = "1"
 
 # Internal crates
 kyomi-connect-protocol = { version = "1.3.0", path = "crates/kyomi-connect-protocol" }
-kyomi-datasource = { version = "1.5.0", path = "crates/kyomi-datasource" }
+kyomi-datasource = { version = "1.5.1", path = "crates/kyomi-datasource" }
 
 [profile.release]
 opt-level = "z"
