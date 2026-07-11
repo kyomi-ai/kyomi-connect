@@ -8,18 +8,25 @@
 //! ## Usage
 //!
 //! ```text
-//! let tunnel = SshTunnel::connect(
-//!     "bastion.example.com", 22,
-//!     "ubuntu",
-//!     pem_key_str,
-//!     "db.internal", 5432,
-//! ).await?;
+//! let cfg = SshTunnelConfig::from_connection_config(&connection_config)
+//!     .expect("ssh enabled")?;
+//! let tunnel = SshTunnel::connect(&cfg, "db.internal", 5432).await?;
 //!
 //! let (host, port) = tunnel.local_addr();
 //! // Connect to the database via host:port
 //!
 //! tunnel.close().await;
 //! ```
+//!
+//! ## Security
+//!
+//! * **Encrypted private keys**: set `ssh_passphrase` in `connection_config` if
+//!   `ssh_private_key` is passphrase-protected.
+//! * **Host key verification**: by default, any SSH host key is accepted (the
+//!   bastion is admin-controlled, so this mirrors the historical behavior).
+//!   Set `ssh_host_fingerprint` to the bastion's `SHA256:...` fingerprint
+//!   (as printed by `ssh-keygen -lf`) to pin it — the tunnel will refuse to
+//!   connect if the presented host key doesn't match.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,33 +67,30 @@ impl SshTunnel {
     ///
     /// # Arguments
     ///
-    /// * `ssh_host` - Bastion/jump host hostname or IP.
-    /// * `ssh_port` - SSH port (typically 22).
-    /// * `ssh_username` - SSH username for authentication.
-    /// * `ssh_private_key_pem` - PEM-encoded private key (Ed25519 or RSA).
+    /// * `cfg` - SSH tunnel configuration (bastion host, credentials,
+    ///   optional passphrase and pinned host-key fingerprint).
     /// * `target_host` - Database host from the bastion's perspective.
     /// * `target_port` - Database port.
     ///
     /// # Errors
     ///
-    /// Returns an error if the key cannot be parsed, SSH connection fails,
+    /// Returns an error if the key cannot be parsed (including a
+    /// passphrase-protected key with no or an incorrect passphrase), the SSH
+    /// connection fails, the host key doesn't match a pinned fingerprint,
     /// authentication fails, or the local listener cannot bind.
     pub async fn connect(
-        ssh_host: &str,
-        ssh_port: u16,
-        ssh_username: &str,
-        ssh_private_key_pem: &str,
+        cfg: &SshTunnelConfig,
         target_host: &str,
         target_port: u16,
     ) -> kyomi_connect_protocol::Result<Self> {
-        let ssh_port = if ssh_port == 0 {
+        let ssh_port = if cfg.port == 0 {
             DEFAULT_SSH_PORT
         } else {
-            ssh_port
+            cfg.port
         };
 
         tracing::info!(
-            ssh_host = ssh_host,
+            ssh_host = cfg.host.as_str(),
             ssh_port = ssh_port,
             target_host = target_host,
             target_port = target_port,
@@ -94,13 +98,15 @@ impl SshTunnel {
         );
 
         // Parse the PEM private key
-        let private_key = Self::parse_private_key(ssh_private_key_pem)?;
+        let private_key = Self::parse_private_key(&cfg.private_key, cfg.passphrase.as_deref())?;
 
         // Connect to the SSH server
         let config = Arc::new(russh::client::Config::default());
-        let handler = TunnelClientHandler;
+        let handler = TunnelClientHandler {
+            expected_fingerprint: cfg.host_fingerprint.clone(),
+        };
 
-        let addr = format!("{ssh_host}:{ssh_port}");
+        let addr = format!("{}:{ssh_port}", cfg.host);
         let mut handle = tokio::time::timeout(
             crate::DATASOURCE_TIMEOUT_CONNECT,
             russh::client::connect(config, &addr, handler),
@@ -115,7 +121,7 @@ impl SshTunnel {
         .map_err(|e| Error::Internal(format!("SSH connection to {addr} failed: {e}")))?;
 
         // Authenticate with the private key
-        let username = ssh_username.to_string();
+        let username = cfg.username.clone();
         let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
         let auth_result = handle
             .authenticate_publickey(&username, key_with_alg)
@@ -201,9 +207,22 @@ impl Drop for SshTunnel {
 
 impl SshTunnel {
     /// Parse a PEM-encoded SSH private key (Ed25519 or RSA).
-    fn parse_private_key(pem: &str) -> kyomi_connect_protocol::Result<PrivateKey> {
-        russh::keys::decode_secret_key(pem, None)
-            .map_err(|e| Error::Internal(format!("Failed to parse SSH private key: {e}")))
+    ///
+    /// `passphrase` decrypts the key if it is passphrase-protected. Pass
+    /// `None` for unencrypted keys.
+    fn parse_private_key(
+        pem: &str,
+        passphrase: Option<&str>,
+    ) -> kyomi_connect_protocol::Result<PrivateKey> {
+        russh::keys::decode_secret_key(pem, passphrase).map_err(|e| {
+            if matches!(e, russh::keys::Error::KeyIsEncrypted) {
+                Error::Provider(
+                    "SSH private key is encrypted; set ssh_passphrase to decrypt it".into(),
+                )
+            } else {
+                Error::Internal(format!("Failed to parse SSH private key: {e}"))
+            }
+        })
     }
 
     /// Background task that accepts TCP connections on the local listener
@@ -325,26 +344,62 @@ impl SshTunnel {
 
 /// Minimal SSH client handler for tunnel connections.
 ///
-/// We don't need to handle any server-initiated messages for port forwarding;
-/// this handler just satisfies the `client::Handler` trait requirement.
-struct TunnelClientHandler;
+/// We don't need to handle any server-initiated messages for port forwarding
+/// beyond host-key verification.
+struct TunnelClientHandler {
+    /// Pinned SHA256 host-key fingerprint (`SHA256:...`), if configured via
+    /// `ssh_host_fingerprint`. When `None`, any host key is accepted (the
+    /// historical, backward-compatible behavior — the bastion is
+    /// admin-controlled). When `Some`, the server's host key must match or
+    /// the connection is rejected.
+    expected_fingerprint: Option<String>,
+}
 
 impl russh::client::Handler for TunnelClientHandler {
     type Error = russh::Error;
 
-    /// Accept any host key. In a production SSH client you would verify
-    /// the host key against known_hosts, but for database tunneling the
-    /// SSH configuration is admin-controlled.
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        tracing::warn!(
-            key_type = %format!("{:?}", server_public_key.algorithm()),
-            "Accepting SSH host key without verification (admin-controlled tunnel config)"
-        );
-        Ok(true)
+        let Some(expected) = &self.expected_fingerprint else {
+            tracing::warn!(
+                key_type = %format!("{:?}", server_public_key.algorithm()),
+                "Accepting SSH host key without verification (no ssh_host_fingerprint configured)"
+            );
+            return Ok(true);
+        };
+
+        let actual = server_public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+
+        if fingerprint_matches(expected, &actual) {
+            tracing::info!(fingerprint = %actual, "SSH host key fingerprint verified");
+            Ok(true)
+        } else {
+            tracing::error!(
+                expected = %expected,
+                actual = %actual,
+                "SSH host key fingerprint mismatch — rejecting connection"
+            );
+            Ok(false)
+        }
     }
+}
+
+/// Compare a pinned SSH host-key fingerprint (from `ssh_host_fingerprint`)
+/// against the fingerprint computed from the server's actual host key.
+///
+/// Extracted as a pure function so the comparison logic is unit-testable
+/// without a live SSH server.
+///
+/// Trims surrounding whitespace on the pinned value — users typically paste
+/// the fingerprint from `ssh-keygen -lf` / `ssh-keyscan` output into a config
+/// field, which often carries a trailing newline. Case is significant (the
+/// digest is base64), so it is preserved.
+fn fingerprint_matches(expected: &str, actual: &str) -> bool {
+    expected.trim() == actual.trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +419,14 @@ pub struct SshTunnelConfig {
     pub username: String,
     /// PEM-encoded SSH private key.
     pub private_key: String,
+    /// Passphrase to decrypt `private_key`, if it is passphrase-protected.
+    /// `None` if the key is unencrypted or no passphrase was configured.
+    pub passphrase: Option<String>,
+    /// Pinned SSH host-key fingerprint, in standard OpenSSH `SHA256:...`
+    /// format (as printed by `ssh-keygen -lf`). When set, the tunnel refuses
+    /// to connect if the bastion's host key doesn't match. `None` means any
+    /// host key is accepted (backward-compatible default).
+    pub host_fingerprint: Option<String>,
 }
 
 impl SshTunnelConfig {
@@ -412,12 +475,186 @@ impl SshTunnelConfig {
             }
         };
 
+        let passphrase = config
+            .get("ssh_passphrase")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let host_fingerprint = config
+            .get("ssh_host_fingerprint")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         Some(Ok(Self {
             enabled,
             host,
             port,
             username,
             private_key,
+            passphrase,
+            host_fingerprint,
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> serde_json::Value {
+        serde_json::json!({
+            "ssh_enabled": true,
+            "ssh_host": "bastion.example.com",
+            "ssh_username": "ubuntu",
+            "ssh_private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",
+        })
+    }
+
+    // -- ssh_passphrase parsing -----------------------------------------
+
+    #[test]
+    fn passphrase_absent_is_none() {
+        let config = base_config();
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(cfg.passphrase, None);
+    }
+
+    #[test]
+    fn passphrase_empty_string_is_none() {
+        let mut config = base_config();
+        config["ssh_passphrase"] = serde_json::json!("");
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(cfg.passphrase, None);
+    }
+
+    #[test]
+    fn passphrase_present_is_parsed() {
+        let mut config = base_config();
+        config["ssh_passphrase"] = serde_json::json!("hunter42");
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(cfg.passphrase.as_deref(), Some("hunter42"));
+    }
+
+    // -- ssh_host_fingerprint parsing ------------------------------------
+
+    #[test]
+    fn host_fingerprint_absent_is_none() {
+        let config = base_config();
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(cfg.host_fingerprint, None);
+    }
+
+    #[test]
+    fn host_fingerprint_empty_string_is_none() {
+        let mut config = base_config();
+        config["ssh_host_fingerprint"] = serde_json::json!("");
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(cfg.host_fingerprint, None);
+    }
+
+    #[test]
+    fn host_fingerprint_present_is_parsed() {
+        let mut config = base_config();
+        config["ssh_host_fingerprint"] =
+            serde_json::json!("SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog");
+        let cfg = SshTunnelConfig::from_connection_config(&config)
+            .expect("ssh enabled")
+            .expect("valid config");
+        assert_eq!(
+            cfg.host_fingerprint.as_deref(),
+            Some("SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog")
+        );
+    }
+
+    // -- fingerprint_matches ----------------------------------------------
+
+    #[test]
+    fn fingerprint_matches_identical_strings() {
+        let fp = "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog";
+        assert!(fingerprint_matches(fp, fp));
+    }
+
+    #[test]
+    fn fingerprint_matches_ignores_surrounding_whitespace() {
+        let fp = "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog";
+        assert!(fingerprint_matches(&format!("  {fp}\n"), fp));
+    }
+
+    #[test]
+    fn fingerprint_matches_rejects_different_strings() {
+        assert!(!fingerprint_matches(
+            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ));
+    }
+
+    #[test]
+    fn fingerprint_matches_rejects_empty_actual() {
+        assert!(!fingerprint_matches(
+            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog",
+            "",
+        ));
+    }
+
+    // -- parse_private_key passphrase round-trip --------------------------
+    //
+    // Fixture is the AES256-CTR-encrypted Ed25519 test key from the
+    // `ssh-key` crate's own test suite (RustCrypto/SSH, Apache-2.0/MIT),
+    // encrypted with the password "hunter42". Using a known-good published
+    // fixture exercises the real decrypt path through
+    // `russh::keys::decode_secret_key` without adding a new dev-dependency
+    // (e.g. `ssh-key`) just to generate one at test time.
+    const ENCRYPTED_ED25519_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBKH96ujW\n\
+umB6/WnTNPjTeaAAAAEAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN\n\
+796jTiQfZfG1KaT0PtFDJ/XFSqtiAAAAoFzvbvyFMhAiwBOXF0mhUUacPUCMZXivG2up2c\n\
+hEnAw1b6BLRPyWbY5cC2n9ggD4ivJ1zSts6sBgjyiXQAReyrP35myYvT/OIB/NpwZM/xIJ\n\
+N7MHSUzlkX4adBrga3f7GS4uv4ChOoxC4XsE5HsxtGsq1X8jzqLlZTmOcxkcEneYQexrUc\n\
+bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
+    #[test]
+    fn parse_private_key_with_correct_passphrase_succeeds() {
+        let result = SshTunnel::parse_private_key(ENCRYPTED_ED25519_KEY, Some("hunter42"));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn parse_private_key_encrypted_without_passphrase_gives_clear_error() {
+        let result = SshTunnel::parse_private_key(ENCRYPTED_ED25519_KEY, None);
+        let err = result.expect_err("encrypted key with no passphrase must fail");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("passphrase") || message.contains("encrypted"),
+            "error message should mention the missing passphrase, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_private_key_with_wrong_passphrase_fails() {
+        let result = SshTunnel::parse_private_key(ENCRYPTED_ED25519_KEY, Some("wrong-password"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_private_key_unencrypted_garbage_still_errors_cleanly() {
+        let result = SshTunnel::parse_private_key("not a key", None);
+        assert!(result.is_err());
     }
 }
