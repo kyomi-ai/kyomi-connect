@@ -15,6 +15,13 @@
 //! | `database` | string | `"master"` | Database name |
 //! | `auth_mode` | string | `"sql"` | `sql`, `service_principal`, `oauth`, or `enterprise_oauth` |
 //! | `trust_server_certificate` | bool | `false` | Trust self-signed certificates (skip TLS verification) |
+//! | `ssh_enabled` | bool | `false` | Whether to use SSH tunnel |
+//! | `ssh_host` | string | — | Bastion host for SSH tunnel |
+//! | `ssh_port` | int | `22` | SSH port |
+//! | `ssh_username` | string | — | SSH username |
+//! | `ssh_private_key` | string | — | PEM-encoded SSH private key |
+//! | `ssh_passphrase` | string | — | Passphrase for an encrypted `ssh_private_key` |
+//! | `ssh_host_fingerprint` | string | — | Pinned bastion host key fingerprint (`SHA256:...`); any key accepted if unset |
 //!
 //! ## Credentials
 //!
@@ -33,6 +40,8 @@ use tokio::sync::Mutex;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::provider::{DatasourceProvider, DryRunResult, QueryResult};
+#[cfg(feature = "ssh")]
+use crate::ssh_tunnel::{SshTunnel, SshTunnelConfig};
 
 use super::tsql_common::{self, TdsClient};
 
@@ -48,6 +57,25 @@ const AZURE_TOKEN_URL_TEMPLATE: &str =
 /// Azure SQL/Synapse resource scope.
 const AZURE_DATABASE_SCOPE: &str = "https://database.windows.net/.default";
 
+/// Compute the physical TCP dial address for the TDS connection.
+///
+/// When an SSH tunnel is active, we must dial the tunnel's local loopback
+/// listener rather than the real Synapse endpoint — but `config` itself
+/// (specifically `config.host`) must NOT be changed to match, because
+/// tiberius derives the TLS ServerName / certificate-hostname check from
+/// `config.get_host()` (see `get_server_name` in tiberius's rustls/native-tls/
+/// opentls stream setup). Azure's certificate is issued for the real
+/// hostname, so validating it against `127.0.0.1` always fails the
+/// handshake. This function is intentionally pure (plain host/port strings,
+/// no `SshTunnel`/network dependency) so the dial-vs-TLS-host split is
+/// unit-testable without a live tunnel or server.
+fn dial_address(config: &Config, tunnel_local_addr: Option<(&str, u16)>) -> String {
+    match tunnel_local_addr {
+        Some((host, port)) => format!("{host}:{port}"),
+        None => config.get_addr(),
+    }
+}
+
 /// Azure Synapse Analytics datasource provider.
 ///
 /// Uses `tiberius` for TDS protocol communication. Supports three auth modes:
@@ -56,6 +84,9 @@ const AZURE_DATABASE_SCOPE: &str = "https://database.windows.net/.default";
 pub struct SynapseProvider {
     /// TDS client, behind a mutex because tiberius requires `&mut self`.
     client: Arc<Mutex<TdsClient>>,
+    /// SSH tunnel, if configured. Held to keep the tunnel alive.
+    #[cfg(feature = "ssh")]
+    _ssh_tunnel: Option<SshTunnel>,
 }
 
 impl SynapseProvider {
@@ -76,11 +107,22 @@ impl SynapseProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
+        // Azure Synapse's TLS certificate is issued for the real hostname
+        // (`*.azuresynapse.net`), so `server`/`port` must stay the true
+        // remote endpoint for the lifetime of this function — they feed
+        // `config.host(...)`, which tiberius uses both to derive the TLS
+        // ServerName (`get_server_name`/`native_tls`/`opentls` all call
+        // `config.get_host()`) and, absent an SSH tunnel, the dial address.
+        // An SSH tunnel changes *where we physically connect the TCP socket*
+        // (`dial_addr`, computed below), never the hostname TLS validates
+        // against.
         let server = connection_config
             .get("server")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Provider("Azure Synapse requires a server address".into()))?
             .to_string();
+
+        let port = DEFAULT_PORT;
 
         let database = connection_config
             .get("database")
@@ -116,10 +158,29 @@ impl SynapseProvider {
             }
         };
 
-        // Build tiberius Config — Azure always requires encryption
+        // SSH tunnel setup. Note: unlike postgres/sqlserver, we do NOT
+        // reassign `server`/`port` to the tunnel's loopback endpoint here —
+        // see the comment above their declaration. The tunnel is only used
+        // to compute `dial_addr` below.
+        #[cfg(feature = "ssh")]
+        let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
+            Some(Ok(ssh_config)) => {
+                let tunnel = SshTunnel::connect(&ssh_config, &server, port).await?;
+                Some(tunnel)
+            }
+            Some(Err(e)) => return Err(e),
+            None => None,
+        };
+
+        // Build tiberius Config — Azure always requires encryption regardless
+        // of whether an SSH tunnel is in use: the tunnel only provides
+        // network-level access to the bastion, not a substitute for Azure's
+        // TLS requirement on the Synapse endpoint itself. `config.host` is
+        // the real Azure hostname (see comment above `server`'s declaration)
+        // so TLS SNI + certificate validation succeed regardless of tunnel use.
         let mut config = Config::new();
         config.host(&server);
-        config.port(DEFAULT_PORT);
+        config.port(port);
         config.database(&database);
         config.authentication(auth);
         config.encryption(EncryptionLevel::Required);
@@ -131,22 +192,31 @@ impl SynapseProvider {
             config.trust_cert();
         }
 
-        // Establish TCP connection
-        let addr = config.get_addr();
-        let tcp =
-            tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, TcpStream::connect(&addr))
-                .await
-                .map_err(|_| {
-                    Error::Internal(format!(
-                        "Azure Synapse TCP connection to {addr} timed out after {}s",
-                        crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
-                    ))
-                })?
-                .map_err(|e| {
-                    Error::Internal(format!(
-                        "Azure Synapse TCP connection to {addr} failed: {e}"
-                    ))
-                })?;
+        // Decide where to physically dial the TCP socket. This is
+        // deliberately decoupled from `config.host`: when a tunnel is
+        // active we dial its local loopback listener, but TLS still
+        // validates against the real Azure hostname carried by `config`.
+        #[cfg(feature = "ssh")]
+        let dial_addr = dial_address(&config, ssh_tunnel.as_ref().map(SshTunnel::local_addr));
+        #[cfg(not(feature = "ssh"))]
+        let dial_addr = dial_address(&config, None);
+
+        let tcp = tokio::time::timeout(
+            crate::DATASOURCE_TIMEOUT_CONNECT,
+            TcpStream::connect(&dial_addr),
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "Azure Synapse TCP connection to {dial_addr} timed out after {}s",
+                crate::DATASOURCE_TIMEOUT_CONNECT.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            Error::Internal(format!(
+                "Azure Synapse TCP connection to {dial_addr} failed: {e}"
+            ))
+        })?;
 
         tcp.set_nodelay(true)
             .map_err(|e| Error::Internal(format!("Failed to set TCP_NODELAY: {e}")))?;
@@ -167,6 +237,8 @@ impl SynapseProvider {
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
+            #[cfg(feature = "ssh")]
+            _ssh_tunnel: ssh_tunnel,
         })
     }
 
@@ -660,5 +732,67 @@ mod tests {
             url,
             "https://login.microsoftonline.com/my-tenant-123/oauth2/v2.0/token"
         );
+    }
+
+    // -- dial_address / TLS-hostname regression --------------------------
+    //
+    // Regression coverage for a bug where the SSH tunnel's loopback address
+    // leaked into `config.host`, which tiberius uses to derive the TLS
+    // ServerName / certificate-hostname check (see `get_server_name` and the
+    // native-tls/opentls connect calls in tiberius's `client::tls_stream`
+    // module, all of which call `config.get_host()`). Azure issues its
+    // certificate for the real `*.azuresynapse.net` hostname, so once that
+    // got overwritten with `127.0.0.1`, every real synapse+SSH connection
+    // failed its TLS handshake. These tests build the same `Config` `new()`
+    // builds and assert `config.get_addr()` (the public accessor backed by
+    // `get_host()`) still reflects the real hostname — with or without a
+    // tunnel — and that the *dial* address is the only thing that changes.
+
+    #[cfg(feature = "synapse")]
+    fn build_synapse_config(server: &str, port: u16) -> Config {
+        // Mirrors the config construction in `SynapseProvider::new`.
+        let mut config = Config::new();
+        config.host(server);
+        config.port(port);
+        config.database(DEFAULT_DATABASE);
+        config.encryption(EncryptionLevel::Required);
+        config
+    }
+
+    #[cfg(feature = "synapse")]
+    #[test]
+    fn dial_address_without_tunnel_dials_the_real_azure_host() {
+        let server = "my-workspace.sql.azuresynapse.net";
+        let config = build_synapse_config(server, DEFAULT_PORT);
+
+        let dial_addr = dial_address(&config, None);
+
+        assert_eq!(dial_addr, format!("{server}:{DEFAULT_PORT}"));
+        // The TLS-relevant host (what tiberius's get_server_name/native_tls/
+        // opentls paths validate against) is unchanged.
+        assert_eq!(config.get_addr(), format!("{server}:{DEFAULT_PORT}"));
+    }
+
+    #[cfg(feature = "synapse")]
+    #[test]
+    fn dial_address_with_tunnel_dials_loopback_but_tls_host_stays_real() {
+        let server = "my-workspace.sql.azuresynapse.net";
+        let config = build_synapse_config(server, DEFAULT_PORT);
+
+        // Simulates an active SSH tunnel whose local listener is on a
+        // random loopback port — analogous to `SshTunnel::local_addr()`.
+        let tunnel_local_addr = ("127.0.0.1", 54321u16);
+        let dial_addr = dial_address(&config, Some(tunnel_local_addr));
+
+        // We physically connect to the tunnel's loopback endpoint...
+        assert_eq!(dial_addr, "127.0.0.1:54321");
+
+        // ...but the TLS ServerName tiberius will validate the Azure
+        // certificate against (config.get_addr(), backed by get_host())
+        // must still be the real hostname, NOT the loopback address. This
+        // is the exact invariant the original bug violated by reassigning
+        // `server` to the tunnel host before calling `config.host(&server)`.
+        assert_eq!(config.get_addr(), format!("{server}:{DEFAULT_PORT}"));
+        assert_ne!(config.get_addr(), dial_addr);
     }
 }

@@ -17,6 +17,8 @@
 //! | `ssh_port` | int | `22` | SSH port |
 //! | `ssh_username` | string | — | SSH username |
 //! | `ssh_private_key` | string | — | PEM-encoded SSH private key |
+//! | `ssh_passphrase` | string | — | Passphrase for an encrypted `ssh_private_key` |
+//! | `ssh_host_fingerprint` | string | — | Pinned bastion host key fingerprint (`SHA256:...`); any key accepted if unset |
 //!
 //! ## Credentials
 //!
@@ -117,15 +119,7 @@ impl PostgresProvider {
         #[cfg(feature = "ssh")]
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
-                let tunnel = SshTunnel::connect(
-                    &ssh_config.host,
-                    ssh_config.port,
-                    &ssh_config.username,
-                    &ssh_config.private_key,
-                    &host,
-                    port,
-                )
-                .await?;
+                let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
 
                 let (tunnel_host, tunnel_port) = tunnel.local_addr();
                 host = tunnel_host.to_string();

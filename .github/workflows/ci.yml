@@ -54,6 +54,7 @@ jobs:
           - synapse
           - redshift
           - postgres,ssh
+          - synapse,ssh
           - datafusion-providers,ssh
           - all
     steps:
