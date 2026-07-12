@@ -427,6 +427,19 @@ impl CommandExecutor {
             0,
         );
 
+        // Defense-in-depth: mirror the direct-path Rust filter (KYO-128) so the
+        // Connect and direct catalog paths return the same schema set even if
+        // svv_all_schemas ever surfaces a session-scoped pg_temp_* namespace or
+        // an unexpectedly-cased system schema. Only applies to Redshift.
+        let items = if self.db_type == "redshift" {
+            items
+                .into_iter()
+                .filter(|n| !is_redshift_system_schema(n))
+                .collect()
+        } else {
+            items
+        };
+
         Ok(items)
     }
 
@@ -602,6 +615,32 @@ fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// System schemas excluded from Redshift catalog discovery (case-insensitive).
+/// Mirrors the direct-path filter in the kyomi-agent redshift indexer (KYO-128).
+const REDSHIFT_SYSTEM_SCHEMAS: &[&str] = &[
+    "pg_catalog",
+    "pg_internal",
+    "information_schema",
+    "pg_toast",
+    "pg_automv",
+    "pg_auto_copy",
+    "pg_mv",
+    "pg_s3",
+    "catalog_history",
+];
+
+/// Prefixes for temp schemas excluded dynamically (e.g. pg_temp_1, pg_temp_99).
+const REDSHIFT_SYSTEM_SCHEMA_PREFIXES: &[&str] = &["pg_temp_"];
+
+/// Check if a schema name is a Redshift system schema (case-insensitive).
+fn is_redshift_system_schema(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    REDSHIFT_SYSTEM_SCHEMAS.iter().any(|s| lower == *s)
+        || REDSHIFT_SYSTEM_SCHEMA_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +658,26 @@ mod tests {
     #[test]
     fn escape_sql_literal_multiple_quotes() {
         assert_eq!(escape_sql_literal("a'b'c"), "a''b''c");
+    }
+
+    #[test]
+    fn redshift_system_schema_detection() {
+        assert!(is_redshift_system_schema("pg_catalog"));
+        assert!(is_redshift_system_schema("PG_CATALOG"));
+        assert!(is_redshift_system_schema("pg_internal"));
+        assert!(is_redshift_system_schema("information_schema"));
+        assert!(is_redshift_system_schema("pg_toast"));
+        assert!(is_redshift_system_schema("pg_temp_1"));
+        assert!(is_redshift_system_schema("pg_temp_99"));
+        assert!(is_redshift_system_schema("pg_automv"));
+        assert!(is_redshift_system_schema("PG_AUTOMV"));
+        assert!(is_redshift_system_schema("pg_auto_copy"));
+        assert!(is_redshift_system_schema("pg_mv"));
+        assert!(is_redshift_system_schema("pg_s3"));
+        assert!(is_redshift_system_schema("catalog_history"));
+
+        assert!(!is_redshift_system_schema("public"));
+        assert!(!is_redshift_system_schema("myschema"));
+        assert!(!is_redshift_system_schema("analytics"));
     }
 }
