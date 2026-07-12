@@ -382,9 +382,16 @@ impl CommandExecutor {
     /// Discover containers (schemas/databases) for the datasource type.
     async fn discover_containers(&self) -> anyhow::Result<Vec<String>> {
         let sql = match self.db_type.as_str() {
-            "postgres" | "redshift" => {
+            "postgres" => {
                 "SELECT schema_name FROM information_schema.schemata \
                  WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                 ORDER BY schema_name"
+            }
+            "redshift" => {
+                "SELECT schema_name FROM svv_all_schemas \
+                 WHERE database_name = current_database() \
+                   AND schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_internal', 'pg_toast', \
+                                           'pg_automv', 'pg_auto_copy', 'pg_mv', 'pg_s3', 'catalog_history') \
                  ORDER BY schema_name"
             }
             "mysql" => {
