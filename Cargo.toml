@@ -81,7 +81,7 @@ rand = "0.9"
 http = "1"
 
 # Internal crates
-kyomi-connect-protocol = { version = "1.3.0", path = "crates/kyomi-connect-protocol" }
+kyomi-connect-protocol = { version = "1.4.0", path = "crates/kyomi-connect-protocol" }
 kyomi-datasource = { version = "1.6.0", path = "crates/kyomi-datasource" }
 
 [profile.release]

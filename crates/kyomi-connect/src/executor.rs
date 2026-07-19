@@ -6,7 +6,7 @@ use kyomi_connect_protocol::ArrowStreamEvent;
 use kyomi_connect_protocol::stream::QueryFormat;
 use kyomi_connect_protocol::wire::{
     CatalogColumn, CatalogContainer, CatalogResult, CatalogTable, ConnectOp, ConnectRequest,
-    ConnectResponse, ConnectResponseBody, DryRunParams, QueryParams,
+    ConnectResponse, ConnectResponseBody, DiscoverCatalogParams, DryRunParams, QueryParams,
 };
 use kyomi_datasource::arrow_builder::{batch_to_ipc_bytes, schema_to_ipc_bytes};
 use kyomi_datasource::provider::DatasourceProvider;
@@ -67,7 +67,9 @@ impl CommandExecutor {
                 let result = match other_op {
                     ConnectOp::TestConnection => self.handle_test_connection().await,
                     ConnectOp::DryRun => self.handle_dry_run(request.params).await,
-                    ConnectOp::DiscoverCatalog => self.handle_discover_catalog().await,
+                    ConnectOp::DiscoverCatalog => {
+                        self.handle_discover_catalog(request.params).await
+                    }
                     ConnectOp::ExecuteQuery => unreachable!(),
                 };
                 vec![ConnectResponse {
@@ -348,12 +350,47 @@ impl CommandExecutor {
         serde_json::to_value(&result).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Discover the full catalog (containers/tables/columns) using
-    /// information_schema queries specific to the database type.
-    async fn handle_discover_catalog(&self) -> anyhow::Result<serde_json::Value> {
-        let containers = self.discover_containers().await?;
-        let mut catalog_containers = Vec::new();
+    /// Discover the catalog (containers/tables/columns) using information_schema
+    /// queries specific to the database type.
+    ///
+    /// Honors the optional [`DiscoverCatalogParams`] scope (KYO-162):
+    /// - `containers`: restrict discovery to the named schemas/databases
+    ///   (case-insensitive). `None`/empty means "all containers".
+    /// - `containers_only`: return just container names with empty `tables`,
+    ///   skipping the per-table column crawl (used to populate the scope picker).
+    ///
+    /// `params == None` (a legacy caller) is treated as an unscoped full crawl.
+    async fn handle_discover_catalog(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let params: DiscoverCatalogParams = match params {
+            Some(value) => serde_json::from_value(value)
+                .map_err(|e| anyhow::anyhow!("invalid discover_catalog params: {e}"))?,
+            None => DiscoverCatalogParams::default(),
+        };
 
+        let containers = filter_containers_to_scope(
+            self.discover_containers().await?,
+            params.containers.as_deref(),
+        );
+
+        // Lightweight listing for the scope picker: container names only.
+        if params.containers_only {
+            let catalog_containers = containers
+                .into_iter()
+                .map(|name| CatalogContainer {
+                    name,
+                    tables: Vec::new(),
+                })
+                .collect();
+            let result = CatalogResult {
+                containers: catalog_containers,
+            };
+            return serde_json::to_value(&result).map_err(|e| anyhow::anyhow!("{e}"));
+        }
+
+        let mut catalog_containers = Vec::new();
         for container_name in &containers {
             let tables = self.discover_tables(container_name).await?;
             let mut catalog_tables = Vec::new();
@@ -641,9 +678,62 @@ fn is_redshift_system_schema(name: &str) -> bool {
             .any(|p| lower.starts_with(p))
 }
 
+/// Restrict a discovered container list to a requested scope (KYO-162).
+///
+/// A `None` or empty scope means "all containers" (the historical behavior),
+/// so the full list is returned unchanged. Otherwise only containers whose name
+/// matches an entry in `scope` (case-insensitively) are kept; requested names
+/// that don't exist are simply absent from the result.
+fn filter_containers_to_scope(containers: Vec<String>, scope: Option<&[String]>) -> Vec<String> {
+    match scope {
+        Some(scope) if !scope.is_empty() => containers
+            .into_iter()
+            .filter(|name| scope.iter().any(|s| s.eq_ignore_ascii_case(name)))
+            .collect(),
+        _ => containers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_containers_none_scope_returns_all() {
+        let all = vec!["public".to_string(), "analytics".to_string()];
+        assert_eq!(filter_containers_to_scope(all.clone(), None), all);
+    }
+
+    #[test]
+    fn filter_containers_empty_scope_returns_all() {
+        // An explicit empty list must NOT mean "index nothing" here — the
+        // agent-side default is "all"; the backend enforces empty-means-none
+        // before it ever sends a scope. See ConnectIndexer.
+        let all = vec!["public".to_string(), "analytics".to_string()];
+        assert_eq!(filter_containers_to_scope(all.clone(), Some(&[])), all);
+    }
+
+    #[test]
+    fn filter_containers_keeps_only_requested_case_insensitive() {
+        let all = vec![
+            "public".to_string(),
+            "Analytics".to_string(),
+            "staging".to_string(),
+        ];
+        let scope = vec!["ANALYTICS".to_string(), "public".to_string()];
+        let kept = filter_containers_to_scope(all, Some(&scope));
+        assert_eq!(kept, vec!["public".to_string(), "Analytics".to_string()]);
+    }
+
+    #[test]
+    fn filter_containers_ignores_unknown_requested_names() {
+        let all = vec!["public".to_string()];
+        let scope = vec!["public".to_string(), "does_not_exist".to_string()];
+        assert_eq!(
+            filter_containers_to_scope(all, Some(&scope)),
+            vec!["public".to_string()]
+        );
+    }
 
     #[test]
     fn escape_sql_literal_no_quotes() {

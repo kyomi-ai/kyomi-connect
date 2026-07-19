@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "kyomi-connect"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "kyomi-connect-protocol"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
