@@ -46,8 +46,9 @@ pub enum ConnectOp {
 /// The `params` field is a raw JSON value whose structure depends on the `op`.
 /// The receiver reads `op` first, then deserializes `params` into the appropriate
 /// typed struct (e.g., [`QueryParams`] for `execute_query`, [`DryRunParams`] for
-/// `dry_run`). Operations like `test_connection` and `discover_catalog` have no
-/// parameters, so `params` is `None`.
+/// `dry_run`, [`DiscoverCatalogParams`] for `discover_catalog`). `test_connection`
+/// takes no parameters, so its `params` is `None`; `discover_catalog` accepts an
+/// optional [`DiscoverCatalogParams`] and treats `None` as "discover everything".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectRequest {
     /// Unique request identifier for correlating responses.
@@ -96,6 +97,33 @@ pub struct QueryParams {
 pub struct DryRunParams {
     /// SQL query to validate.
     pub sql: String,
+}
+
+/// Parameters for the `discover_catalog` operation.
+///
+/// Every field is optional and defaults to "no scope", so this struct is fully
+/// backward/forward compatible with peers that predate it:
+/// - An older backend sends `params: None` → the agent discovers everything.
+/// - An older agent ignores `params` entirely → it also discovers everything,
+///   including a full table/column crawl even when `containers_only` was
+///   requested. Callers must therefore tolerate a fully-populated `tables` list
+///   in the response regardless of what they asked for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiscoverCatalogParams {
+    /// Containers (schemas/databases) to include. `None` or an empty list means
+    /// "all containers" (the historical behavior). Matched case-insensitively
+    /// against the agent's discovered container names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<String>>,
+    /// BigQuery only: include public datasets in discovery. Ignored by SQL
+    /// warehouse agents. Absent from older messages — defaults to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_public_datasets: Option<bool>,
+    /// When `true`, return only container names (each with an empty `tables`
+    /// list) and skip the per-table column crawl. Used to populate the scope
+    /// picker cheaply. Older agents ignore this and return the full catalog.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub containers_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +963,45 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         let parsed: QueryParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.format, QueryFormat::Arrow);
+    }
+
+    // -----------------------------------------------------------------------
+    // DiscoverCatalogParams (scoped indexing — KYO-162)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discover_catalog_params_empty_object_is_discover_all() {
+        // An older/scope-less caller sends `{}` (or `null`) — must mean "all":
+        // no container filter and no lightweight listing.
+        let params: DiscoverCatalogParams = serde_json::from_str("{}").unwrap();
+        assert!(params.containers.is_none());
+        assert!(params.include_public_datasets.is_none());
+        assert!(!params.containers_only);
+    }
+
+    #[test]
+    fn discover_catalog_params_default_serializes_to_empty_object() {
+        // With every field skipped when empty/false, the default serializes to
+        // `{}` so it is wire-indistinguishable from a legacy parameterless call.
+        let json = serde_json::to_string(&DiscoverCatalogParams::default()).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn discover_catalog_params_roundtrip_with_scope() {
+        let params = DiscoverCatalogParams {
+            containers: Some(vec!["public".into(), "analytics".into()]),
+            include_public_datasets: Some(true),
+            containers_only: true,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: DiscoverCatalogParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.containers.as_deref(),
+            Some(&["public".to_string(), "analytics".to_string()][..])
+        );
+        assert_eq!(parsed.include_public_datasets, Some(true));
+        assert!(parsed.containers_only);
     }
 
     // -----------------------------------------------------------------------
