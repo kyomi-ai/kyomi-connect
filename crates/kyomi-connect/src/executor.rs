@@ -9,7 +9,7 @@ use kyomi_connect_protocol::wire::{
     ConnectResponse, ConnectResponseBody, DiscoverCatalogParams, DryRunParams, QueryParams,
 };
 use kyomi_datasource::arrow_builder::{batch_to_ipc_bytes, schema_to_ipc_bytes};
-use kyomi_datasource::provider::DatasourceProvider;
+use kyomi_datasource::provider::{DatasourceProvider, QueryResult, QueryStatus};
 
 /// Streaming threshold: queries requesting more than this many rows (or no
 /// limit at all) use the streaming path that returns multiple messages.
@@ -459,6 +459,8 @@ impl CommandExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list containers: {e}"))?;
 
+        ensure_query_ok(&result, "Failed to list containers")?;
+
         let items = kyomi_datasource::provider::extract_string_col_from_batch(
             result.record_batch.as_ref(),
             0,
@@ -514,6 +516,8 @@ impl CommandExecutor {
             .execute_query(&sql, None, None, false, None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list tables in '{container}': {e}"))?;
+
+        ensure_query_ok(&result, &format!("Failed to list tables in '{container}'"))?;
 
         let items = if let Some(batch) = result.record_batch.as_ref() {
             let names = batch
@@ -595,6 +599,11 @@ impl CommandExecutor {
                 anyhow::anyhow!("Failed to list columns for '{container}.{table_name}': {e}")
             })?;
 
+        ensure_query_ok(
+            &result,
+            &format!("Failed to list columns for '{container}.{table_name}'"),
+        )?;
+
         let columns = if let Some(batch) = result.record_batch.as_ref() {
             let names = batch
                 .column(0)
@@ -650,6 +659,36 @@ impl CommandExecutor {
 /// Escape single quotes in SQL string literals.
 fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Convert a query-level failure into a Rust error.
+///
+/// Providers report permission errors, timeouts, and bad SQL as
+/// `Ok(QueryResult { status: QueryStatus::Error, error: Some(..) })` rather
+/// than `Err` (see `kyomi_datasource::provider::QueryResult`). Discovery code
+/// that reads `record_batch` without checking `status` first turns a
+/// permission denial into "0 rows discovered" — a Redshift role without
+/// catalog access looked like an empty, successfully-indexed schema
+/// (KYO-126). This must be called immediately after every `execute_query`
+/// used for discovery, before any `record_batch` extraction.
+///
+/// Every current provider implementation
+/// (`crates/kyomi-datasource/src/providers/*.rs`) sets `error: None`
+/// whenever `status == QueryStatus::Success`, so checking `status` alone
+/// would be sufficient for today's providers. This also treats a populated
+/// `error` on a non-`Error` status as a failure: it costs nothing given that
+/// invariant, and it means a future provider that sets `error` but forgets
+/// to flip `status` still gets caught here instead of silently
+/// reintroducing this exact bug.
+fn ensure_query_ok(result: &QueryResult, context: &str) -> anyhow::Result<()> {
+    if result.status == QueryStatus::Error || result.error.is_some() {
+        let message = result
+            .error
+            .as_deref()
+            .unwrap_or("query failed with no error message");
+        return Err(anyhow::anyhow!("{context}: {message}"));
+    }
+    Ok(())
 }
 
 /// System schemas excluded from Redshift catalog discovery (case-insensitive).
@@ -769,5 +808,173 @@ mod tests {
         assert!(!is_redshift_system_schema("public"));
         assert!(!is_redshift_system_schema("myschema"));
         assert!(!is_redshift_system_schema("analytics"));
+    }
+
+    // -----------------------------------------------------------------
+    // ensure_query_ok (KYO-126)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ensure_query_ok_errors_on_error_status_with_message() {
+        let result = QueryResult::error("permission denied for schema svv_all_schemas");
+        let err = ensure_query_ok(&result, "Failed to list containers")
+            .expect_err("error status must propagate as Err");
+        let message = err.to_string();
+        assert!(
+            message.contains("Failed to list containers"),
+            "expected context in message, got: {message}"
+        );
+        assert!(
+            message.contains("permission denied for schema svv_all_schemas"),
+            "expected provider message verbatim, got: {message}"
+        );
+    }
+
+    #[test]
+    fn ensure_query_ok_errors_on_error_status_with_no_message() {
+        // `error` can legitimately be `None` alongside `status == Error` if a
+        // provider forgets to populate it -- must still fail closed with a
+        // sensible fallback rather than panicking or claiming success.
+        let result = QueryResult {
+            status: QueryStatus::Error,
+            error: None,
+            ..QueryResult::success_empty()
+        };
+        let err = ensure_query_ok(&result, "Failed to list tables in 'public'")
+            .expect_err("error status must propagate as Err even without a message");
+        let message = err.to_string();
+        assert!(message.contains("Failed to list tables in 'public'"));
+        assert!(message.contains("no error message"));
+    }
+
+    #[test]
+    fn ensure_query_ok_errors_when_error_message_set_without_error_status() {
+        // Defense-in-depth: a populated `error` should fail closed even if a
+        // provider forgot to flip `status` to `Error`. No current provider
+        // does this (verified against every impl in
+        // crates/kyomi-datasource/src/providers/), but a helper that only
+        // trusted `status` would silently reintroduce KYO-126 the moment one
+        // did.
+        let result = QueryResult {
+            status: QueryStatus::Success,
+            error: Some("unexpected but populated".to_string()),
+            ..QueryResult::success_empty()
+        };
+        assert!(ensure_query_ok(&result, "ctx").is_err());
+    }
+
+    #[test]
+    fn ensure_query_ok_succeeds_on_success_status() {
+        let result = QueryResult::success_empty();
+        assert!(ensure_query_ok(&result, "Failed to list containers").is_ok());
+    }
+
+    #[test]
+    fn ensure_query_ok_succeeds_on_genuinely_empty_result() {
+        // The entire point of KYO-126: an accessible schema with zero tables
+        // is a *successful* discovery, not an error. A `Success` result with
+        // no record_batch/rows must not be treated as a failure.
+        let result = QueryResult {
+            status: QueryStatus::Success,
+            record_batch: None,
+            ..QueryResult::success_empty()
+        };
+        assert!(ensure_query_ok(&result, "Failed to list containers").is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // discover_containers propagation (KYO-126)
+    // -----------------------------------------------------------------
+
+    /// Minimal stub provider whose `execute_query` returns a preset
+    /// `QueryResult` regardless of the SQL it's given, so discovery methods
+    /// can be exercised without a real database connection.
+    struct StubProvider {
+        result: QueryResult,
+    }
+
+    #[async_trait::async_trait]
+    impl DatasourceProvider for StubProvider {
+        async fn test_connection(&self) -> kyomi_connect_protocol::Result<bool> {
+            Ok(true)
+        }
+
+        async fn execute_query(
+            &self,
+            _sql: &str,
+            _limit: Option<u32>,
+            _offset: Option<u32>,
+            _include_total: bool,
+            _job_id: Option<&str>,
+        ) -> kyomi_connect_protocol::Result<QueryResult> {
+            Ok(self.result.clone())
+        }
+
+        async fn close(&self) {}
+    }
+
+    fn executor_with_stub_result(result: QueryResult) -> CommandExecutor {
+        CommandExecutor {
+            provider: Box::new(StubProvider { result }),
+            db_type: "postgres".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_containers_propagates_query_level_failure_as_err() {
+        // Simulates a Redshift/Postgres role without catalog read permission:
+        // the provider returns `Ok(QueryResult { status: Error, .. })`, not a
+        // Rust `Err`. Before the KYO-126 fix this silently produced `Ok(vec![])`.
+        let executor =
+            executor_with_stub_result(QueryResult::error("permission denied for relation"));
+
+        let err = executor
+            .discover_containers()
+            .await
+            .expect_err("query-level failure must propagate as Err, not an empty Ok");
+        assert!(err.to_string().contains("permission denied for relation"));
+    }
+
+    #[tokio::test]
+    async fn discover_containers_returns_empty_vec_for_genuinely_empty_schema_list() {
+        // An accessible database with zero user schemas is a successful
+        // discovery of zero containers -- not a failure.
+        let executor = executor_with_stub_result(QueryResult::success_empty());
+
+        let containers = executor
+            .discover_containers()
+            .await
+            .expect("a successful, empty result must not be treated as an error");
+        assert!(containers.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // discover_tables propagation (KYO-126)
+    //
+    // Same `ensure_query_ok` guard as discover_containers, exercised here to
+    // remove doubt about wiring at this call site specifically (raised in
+    // KYO-126 review): a role that can list schemas but is denied
+    // information_schema.tables access must not silently become "0 tables".
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn discover_tables_propagates_query_level_failure_as_err() {
+        // Simulates a role that can see the schema but is denied read access
+        // to information_schema.tables: the provider returns
+        // `Ok(QueryResult { status: Error, .. })`, not a Rust `Err`. Before
+        // the KYO-126 fix this silently produced `Ok(vec![])`.
+        let executor = executor_with_stub_result(QueryResult::error(
+            "permission denied for relation information_schema.tables",
+        ));
+
+        let err = executor
+            .discover_tables("public")
+            .await
+            .expect_err("query-level failure must propagate as Err, not an empty Ok");
+        assert!(
+            err.to_string()
+                .contains("permission denied for relation information_schema.tables"),
+            "expected provider message verbatim, got: {err}"
+        );
     }
 }
