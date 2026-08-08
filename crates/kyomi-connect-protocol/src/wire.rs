@@ -216,8 +216,25 @@ pub enum ConnectResponseBody {
 /// Full catalog discovery result returned by the `discover_catalog` operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogResult {
-    /// Top-level containers (schemas, datasets, etc.).
+    /// Top-level containers (schemas, datasets, etc.) that were successfully
+    /// discovered. A container that failed partway through discovery (e.g. a
+    /// permission-denied schema) is simply absent here rather than aborting
+    /// the whole result -- see `errors`.
     pub containers: Vec<CatalogContainer>,
+    /// Per-container or per-table failure messages encountered during a
+    /// partial discovery. Empty when every container and table discovered
+    /// cleanly.
+    ///
+    /// Each message names the container (and table, where applicable) it
+    /// came from, so a consumer can attribute it. That naming comes from
+    /// the producing call sites rather than being added here, so treat the
+    /// exact wording as opaque: match on presence and surface the text,
+    /// don't parse it.
+    ///
+    /// `#[serde(default)]` is required: an older Connect agent's response
+    /// predates this field entirely, and deserializing it must keep working.
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 /// A catalog container (schema, dataset, database, etc.).
@@ -730,6 +747,7 @@ mod tests {
                     ],
                 }],
             }],
+            errors: vec![],
         };
         let resp = ConnectResponse {
             id: "dc-1".into(),
@@ -813,10 +831,14 @@ mod tests {
 
     #[test]
     fn catalog_result_empty_roundtrip() {
-        let catalog = CatalogResult { containers: vec![] };
+        let catalog = CatalogResult {
+            containers: vec![],
+            errors: vec![],
+        };
         let json = serde_json::to_string(&catalog).unwrap();
         let parsed: CatalogResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.containers.is_empty());
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]
@@ -840,6 +862,7 @@ mod tests {
                     tables: vec![],
                 },
             ],
+            errors: vec![],
         };
         let json = serde_json::to_string(&catalog).unwrap();
         let parsed: CatalogResult = serde_json::from_str(&json).unwrap();
@@ -854,6 +877,45 @@ mod tests {
         );
         assert_eq!(parsed.containers[1].name, "analytics");
         assert!(parsed.containers[1].tables.is_empty());
+        assert!(parsed.errors.is_empty());
+    }
+
+    #[test]
+    fn catalog_result_with_errors_roundtrip() {
+        // Simulates a partial discovery (KYO-268): one container failed but
+        // the others still came back, and the failure is attributed by name.
+        let catalog = CatalogResult {
+            containers: vec![CatalogContainer {
+                name: "public".into(),
+                tables: vec![],
+            }],
+            errors: vec![
+                "Failed to list tables in 'restricted': permission denied for schema restricted"
+                    .into(),
+            ],
+        };
+        let json = serde_json::to_string(&catalog).unwrap();
+        let parsed: CatalogResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.containers.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].contains("restricted"));
+    }
+
+    #[test]
+    fn catalog_result_deserializes_without_errors_key_for_backward_compatibility() {
+        // An older Connect agent's response predates the `errors` field
+        // entirely -- deserializing it must still succeed, defaulting to an
+        // empty Vec, not fail with a missing-field error.
+        let json = r#"{
+            "containers": [
+                { "name": "public", "tables": [] }
+            ]
+        }"#;
+        let parsed: CatalogResult = serde_json::from_str(json)
+            .expect("payload without an `errors` key must still deserialize");
+        assert_eq!(parsed.containers.len(), 1);
+        assert_eq!(parsed.containers[0].name, "public");
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]

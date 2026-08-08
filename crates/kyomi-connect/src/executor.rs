@@ -386,17 +386,49 @@ impl CommandExecutor {
                 .collect();
             let result = CatalogResult {
                 containers: catalog_containers,
+                errors: Vec::new(),
             };
             return serde_json::to_value(&result).map_err(|e| anyhow::anyhow!("{e}"));
         }
 
+        // Tolerate a single container's (or table's) failure rather than
+        // aborting the whole crawl (KYO-268). Before 66267bb, a
+        // permission-denied container silently yielded zero tables for
+        // itself while the rest still enumerated; 66267bb correctly made
+        // that failure visible via `ensure_query_ok`, but as a side effect
+        // also made it fatal for every other container. Losing one schema
+        // out of ten should not blind search/NL discovery on the other nine.
         let mut catalog_containers = Vec::new();
+        let mut errors = Vec::new();
         for container_name in &containers {
-            let tables = self.discover_tables(container_name).await?;
+            let tables = match self.discover_tables(container_name).await {
+                Ok(tables) => tables,
+                Err(e) => {
+                    tracing::warn!(
+                        container = %container_name,
+                        error = %e,
+                        "discover_tables failed for container; skipping it"
+                    );
+                    errors.push(e.to_string());
+                    continue;
+                }
+            };
             let mut catalog_tables = Vec::new();
 
             for (table_name, table_type) in &tables {
-                let columns = self.discover_columns(container_name, table_name).await?;
+                let columns = match self.discover_columns(container_name, table_name).await {
+                    Ok(columns) => columns,
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %container_name,
+                            table = %table_name,
+                            error = %e,
+                            "discover_columns failed for table; skipping it"
+                        );
+                        errors.push(e.to_string());
+                        continue;
+                    }
+                };
                 catalog_tables.push(CatalogTable {
                     name: table_name.clone(),
                     native_type: Some(table_type.clone()),
@@ -410,8 +442,21 @@ impl CommandExecutor {
             });
         }
 
+        // An empty-but-successful result is exactly the silent-empty
+        // behavior `66267bb` set out to kill. If there was at least one
+        // container to crawl and every single one of them failed, that's a
+        // total failure, not a successful empty catalog.
+        if !containers.is_empty() && catalog_containers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "discover_catalog failed for every container ({} attempted): {}",
+                containers.len(),
+                errors.join("; ")
+            ));
+        }
+
         let result = CatalogResult {
             containers: catalog_containers,
+            errors,
         };
         serde_json::to_value(&result).map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -976,5 +1021,260 @@ mod tests {
                 .contains("permission denied for relation information_schema.tables"),
             "expected provider message verbatim, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // handle_discover_catalog partial-tolerance (KYO-268)
+    //
+    // 66267bb (KYO-126) correctly made a per-container query failure
+    // visible instead of silently masking it as "0 rows", but as a side
+    // effect the bare `?` on discover_tables/discover_columns turned a
+    // single container's failure into a total failure of the whole crawl.
+    // These tests lock in the partial-tolerance behavior: one bad
+    // container/table is recorded and skipped, everything else still comes
+    // back, and total failure is still reported as `Err`.
+    // -----------------------------------------------------------------
+
+    /// Builds a two-column Arrow `RecordBatch` of UTF-8 strings, mirroring
+    /// the `(name, type)` / `(name, type, description)` shapes returned by
+    /// `information_schema.tables` / `information_schema.columns`.
+    fn string_record_batch(columns: Vec<Vec<&str>>) -> arrow::record_batch::RecordBatch {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let fields: Vec<Field> = (0..columns.len())
+            .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = columns
+            .into_iter()
+            .map(|col| Arc::new(StringArray::from(col)) as Arc<dyn arrow::array::Array>)
+            .collect();
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .expect("fixed-size test columns must build a valid RecordBatch")
+    }
+
+    fn tables_result(rows: Vec<(&str, &str)>) -> QueryResult {
+        if rows.is_empty() {
+            return QueryResult::success_empty();
+        }
+        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+        let types: Vec<&str> = rows.iter().map(|(_, t)| *t).collect();
+        QueryResult {
+            record_batch: Some(string_record_batch(vec![names, types])),
+            ..QueryResult::success_empty()
+        }
+    }
+
+    fn columns_result(rows: Vec<(&str, &str)>) -> QueryResult {
+        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+        let types: Vec<&str> = rows.iter().map(|(_, t)| *t).collect();
+        let descs: Vec<&str> = rows.iter().map(|_| "").collect();
+        QueryResult {
+            record_batch: Some(string_record_batch(vec![names, types, descs])),
+            ..QueryResult::success_empty()
+        }
+    }
+
+    /// A `DatasourceProvider` whose response to `execute_query` depends on
+    /// which discovery query it's asked -- containers, a specific
+    /// container's tables, or a specific table's columns -- determined by
+    /// pattern-matching the generated SQL text. Lets a single test exercise
+    /// `handle_discover_catalog`'s full per-container/per-table loop against
+    /// a scripted mix of successes and failures, the same way a real
+    /// datasource would.
+    struct ScriptedProvider {
+        containers: QueryResult,
+        tables: std::collections::HashMap<String, QueryResult>,
+        columns: std::collections::HashMap<(String, String), QueryResult>,
+    }
+
+    #[async_trait::async_trait]
+    impl DatasourceProvider for ScriptedProvider {
+        async fn test_connection(&self) -> kyomi_connect_protocol::Result<bool> {
+            Ok(true)
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+            _limit: Option<u32>,
+            _offset: Option<u32>,
+            _include_total: bool,
+            _job_id: Option<&str>,
+        ) -> kyomi_connect_protocol::Result<QueryResult> {
+            if sql.contains("information_schema.schemata") {
+                return Ok(self.containers.clone());
+            }
+            if sql.contains("information_schema.columns") {
+                let hit = self.columns.iter().find(|((container, table), _)| {
+                    sql.contains(&format!("table_schema = '{container}'"))
+                        && sql.contains(&format!("table_name = '{table}'"))
+                });
+                let (_, result) =
+                    hit.unwrap_or_else(|| panic!("no scripted columns result for sql: {sql}"));
+                return Ok(result.clone());
+            }
+            if sql.contains("information_schema.tables") {
+                let hit = self
+                    .tables
+                    .iter()
+                    .find(|(container, _)| sql.contains(&format!("table_schema = '{container}'")));
+                let (_, result) =
+                    hit.unwrap_or_else(|| panic!("no scripted tables result for sql: {sql}"));
+                return Ok(result.clone());
+            }
+            panic!("unexpected sql in ScriptedProvider: {sql}");
+        }
+
+        async fn close(&self) {}
+    }
+
+    /// Builds a `CommandExecutor` around a `ScriptedProvider`, for a Postgres
+    /// datasource with the given containers list and per-container/per-table
+    /// scripted results.
+    fn executor_with_scripted_catalog(
+        containers: Vec<&str>,
+        tables: Vec<(&str, QueryResult)>,
+        columns: Vec<((&str, &str), QueryResult)>,
+    ) -> CommandExecutor {
+        let containers_result = if containers.is_empty() {
+            QueryResult::success_empty()
+        } else {
+            QueryResult {
+                record_batch: Some(string_record_batch(vec![containers.clone()])),
+                ..QueryResult::success_empty()
+            }
+        };
+        CommandExecutor {
+            provider: Box::new(ScriptedProvider {
+                containers: containers_result,
+                tables: tables
+                    .into_iter()
+                    .map(|(name, result)| (name.to_string(), result))
+                    .collect(),
+                columns: columns
+                    .into_iter()
+                    .map(|((container, table), result)| {
+                        ((container.to_string(), table.to_string()), result)
+                    })
+                    .collect(),
+            }),
+            db_type: "postgres".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_container_discovery_tolerates_one_containers_discover_tables_failure() {
+        let executor = executor_with_scripted_catalog(
+            vec!["public", "restricted", "analytics"],
+            vec![
+                ("public", tables_result(vec![("users", "BASE TABLE")])),
+                (
+                    "restricted",
+                    QueryResult::error("permission denied for schema restricted"),
+                ),
+                ("analytics", tables_result(vec![])),
+            ],
+            vec![(
+                ("public", "users"),
+                columns_result(vec![("id", "int4"), ("email", "varchar")]),
+            )],
+        );
+
+        let value = executor
+            .handle_discover_catalog(None)
+            .await
+            .expect("one bad container must not fail the whole crawl");
+        let result: CatalogResult = serde_json::from_value(value).unwrap();
+
+        let names: Vec<&str> = result.containers.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["public", "analytics"]);
+        assert_eq!(result.containers[0].tables.len(), 1);
+        assert_eq!(result.containers[0].tables[0].name, "users");
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("restricted"),
+            "error must name the failed container, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn container_survives_one_tables_discover_columns_failure() {
+        let executor = executor_with_scripted_catalog(
+            vec!["public"],
+            vec![(
+                "public",
+                tables_result(vec![("users", "BASE TABLE"), ("logs", "BASE TABLE")]),
+            )],
+            vec![
+                (
+                    ("public", "users"),
+                    columns_result(vec![("id", "int4"), ("email", "varchar")]),
+                ),
+                (
+                    ("public", "logs"),
+                    QueryResult::error("permission denied for relation logs"),
+                ),
+            ],
+        );
+
+        let value = executor
+            .handle_discover_catalog(None)
+            .await
+            .expect("one bad table must not drop the whole container");
+        let result: CatalogResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(result.containers.len(), 1);
+        assert_eq!(result.containers[0].name, "public");
+        let table_names: Vec<&str> = result.containers[0]
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(table_names, vec!["users"]);
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("logs"),
+            "error must name the failed table, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn every_container_failing_is_still_an_err() {
+        let executor = executor_with_scripted_catalog(
+            vec!["a", "b"],
+            vec![
+                ("a", QueryResult::error("permission denied for schema a")),
+                ("b", QueryResult::error("permission denied for schema b")),
+            ],
+            vec![],
+        );
+
+        let err = executor
+            .handle_discover_catalog(None)
+            .await
+            .expect_err("every container failing must not report an empty-but-successful result");
+        let message = err.to_string();
+        assert!(message.contains('a') && message.contains('b'));
+    }
+
+    #[tokio::test]
+    async fn zero_containers_is_ok_empty_and_error_free() {
+        let executor = executor_with_scripted_catalog(vec![], vec![], vec![]);
+
+        let value = executor
+            .handle_discover_catalog(None)
+            .await
+            .expect("a genuinely empty container list is success, not failure");
+        let result: CatalogResult = serde_json::from_value(value).unwrap();
+
+        assert!(result.containers.is_empty());
+        assert!(result.errors.is_empty());
     }
 }
