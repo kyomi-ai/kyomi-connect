@@ -14,7 +14,7 @@ tower-http = { version = "0.6", features = ["cors", "limit", "normalize-path", "
 
 # Database drivers (optional, feature-gated)
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "uuid", "chrono", "json", "macros", "rust_decimal"] }
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tiberius = { package = "tiberius-ng", version = "0.13", default-features = false, features = ["tds73", "chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Async runtime
