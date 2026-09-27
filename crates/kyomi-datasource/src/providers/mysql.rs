@@ -73,16 +73,13 @@ impl MySqlProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
-        // When the `ssh` feature is enabled, these are reassigned to the tunnel endpoint.
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut host = connection_config
+        let host = connection_config
             .get("host")
             .and_then(|v| v.as_str())
             .unwrap_or("localhost")
             .to_string();
 
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut port = connection_config
+        let port = connection_config
             .get("port")
             .and_then(|v| v.as_u64())
             .map(|p| p as u16)
@@ -112,35 +109,21 @@ impl MySqlProvider {
         #[cfg(feature = "ssh")]
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
-                let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
-
-                let (tunnel_host, tunnel_port) = tunnel.local_addr();
-                host = tunnel_host.to_string();
-                port = tunnel_port;
-
+                let mut tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
+                tunnel.bind_unix_socket(port).await?;
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
             None => None,
         };
 
-        // When using SSH tunnel, SSL is unnecessary (tunnel provides encryption)
-        #[cfg(feature = "ssh")]
-        let effective_ssl_mode_str = if ssh_tunnel.is_some() {
-            "disable"
-        } else {
-            ssl_mode_str
-        };
-        #[cfg(not(feature = "ssh"))]
-        let effective_ssl_mode_str = ssl_mode_str;
-
-        let ssl_mode = parse_mysql_ssl_mode(effective_ssl_mode_str);
+        let ssl_mode = parse_mysql_ssl_mode(ssl_mode_str);
 
         tracing::info!(
             host = host,
             port = port,
             database = database,
-            ssl_mode = effective_ssl_mode_str,
+            ssl_mode = ssl_mode_str,
             "Connecting to MySQL"
         );
 
@@ -152,6 +135,12 @@ impl MySqlProvider {
             .password(password)
             .charset("utf8mb4")
             .ssl_mode(ssl_mode);
+
+        #[cfg(feature = "ssh")]
+        if let Some(tunnel) = &ssh_tunnel {
+            connect_options =
+                connect_options.socket(tunnel.unix_socket_path().expect("socket bound"));
+        }
 
         // For verify-ca / verify-full, attach the CA certificate if provided
         if matches!(

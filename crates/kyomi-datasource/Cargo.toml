@@ -74,3 +74,4 @@ arrow-ipc = { workspace = true, optional = true }
 [dev-dependencies]
 # HTTP mock server for testing OAuth token exchange
 wiremock = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
