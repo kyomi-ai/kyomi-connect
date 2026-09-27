@@ -925,7 +925,10 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             .expect("TLS request did not reach tunneled server");
         assert!(server_result.unwrap(), "TLS certificate was accepted");
         let error = result.expect_err("IP certificate name must be checked");
-        assert!(format!("{error:?}").contains("InvalidCertificate"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("InvalidCertificate"),
+            "{error:?}"
+        );
     }
 
     #[cfg(feature = "postgres")]
