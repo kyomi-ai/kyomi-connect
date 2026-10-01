@@ -65,10 +65,6 @@ pub struct ClickHouseProvider {
     base_url: String,
     /// Database name.
     database: String,
-    /// ClickHouse username.
-    username: String,
-    /// ClickHouse password.
-    password: String,
     /// Whether the server timezone is UTC. Used to annotate DateTime strings
     /// with "Z" so JavaScript correctly interprets them as UTC.
     server_tz_is_utc: bool,
@@ -85,7 +81,8 @@ impl ClickHouseProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if SSH tunnel setup fails.
+    /// Returns an error if SSH tunnel setup, authentication header validation,
+    /// or HTTP client construction fails.
     pub async fn new(
         connection_config: &Value,
         credentials: &Value,
@@ -160,23 +157,33 @@ impl ClickHouseProvider {
             "Connecting to ClickHouse"
         );
 
-        let client = crate::http_client()?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-clickhouse-user", username),
+            ("x-clickhouse-key", password),
+        ] {
+            let mut value = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| Error::Internal("Invalid ClickHouse authentication header".into()))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::HeaderName::from_static(name), value);
+        }
+        // Custom authentication headers are not stripped by reqwest on redirects.
+        let client = crate::http_client_builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to build ClickHouse HTTP client: {}",
+                    e.without_url()
+                ))
+            })?;
 
         // Query the server timezone to determine if DateTime strings are UTC.
         // ClickHouse HTTP API returns DateTime as bare strings with no timezone
         // indicator. We need to know the server timezone to annotate them correctly.
         let server_tz_is_utc = {
-            let tz_url = format!(
-                "{}/?database={}&user={}{}",
-                base_url,
-                urlencoded(&database),
-                urlencoded(&username),
-                if password.is_empty() {
-                    String::new()
-                } else {
-                    format!("&password={}", urlencoded(&password))
-                },
-            );
+            let tz_url = format!("{}/?database={}", base_url, urlencoded(&database));
             match tokio::time::timeout(
                 crate::DATASOURCE_TIMEOUT_CONNECT,
                 client.post(&tz_url).body("SELECT timezone()").send(),
@@ -201,8 +208,6 @@ impl ClickHouseProvider {
             client,
             base_url,
             database,
-            username,
-            password,
             server_tz_is_utc,
             #[cfg(feature = "ssh")]
             _ssh_tunnel: ssh_tunnel,
@@ -220,12 +225,6 @@ impl ClickHouseProvider {
     ) -> Result<reqwest::Response, Error> {
         let mut url = format!("{}/?database={}", self.base_url, urlencoded(&self.database));
 
-        // Add auth via query params
-        url.push_str(&format!("&user={}", urlencoded(&self.username)));
-        if !self.password.is_empty() {
-            url.push_str(&format!("&password={}", urlencoded(&self.password)));
-        }
-
         // Add format if specified
         if let Some(fmt) = format {
             url.push_str(&format!("&default_format={fmt}"));
@@ -242,7 +241,12 @@ impl ClickHouseProvider {
                 crate::DATASOURCE_TIMEOUT_QUERY.as_secs()
             ))
         })?
-        .map_err(|e| Error::Internal(format!("ClickHouse HTTP request failed: {e}")))?;
+        .map_err(|e| {
+            Error::Internal(format!(
+                "ClickHouse HTTP request failed: {}",
+                e.without_url()
+            ))
+        })?;
 
         Ok(response)
     }
@@ -255,22 +259,21 @@ impl DatasourceProvider for ClickHouseProvider {
             crate::DATASOURCE_TIMEOUT_CONNECT,
             self.client
                 .post(format!(
-                    "{}/?database={}&user={}{}",
+                    "{}/?database={}",
                     self.base_url,
-                    urlencoded(&self.database),
-                    urlencoded(&self.username),
-                    if self.password.is_empty() {
-                        String::new()
-                    } else {
-                        format!("&password={}", urlencoded(&self.password))
-                    },
+                    urlencoded(&self.database)
                 ))
                 .body("SELECT 1")
                 .send(),
         )
         .await
         .map_err(|_| Error::Internal("ClickHouse test connection timed out".into()))?
-        .map_err(|e| Error::Internal(format!("ClickHouse test connection failed: {e}")))?;
+        .map_err(|e| {
+            Error::Internal(format!(
+                "ClickHouse test connection failed: {}",
+                e.without_url()
+            ))
+        })?;
 
         if response.status().is_success() {
             Ok(true)
@@ -506,8 +509,6 @@ impl DatasourceProvider for ClickHouseProvider {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let database = self.database.clone();
-        let username = self.username.clone();
-        let password = self.password.clone();
         let server_tz_is_utc = self.server_tz_is_utc;
 
         let (tx, stream) = super::sqlx_common::make_arrow_stream_channel();
@@ -528,16 +529,11 @@ impl DatasourceProvider for ClickHouseProvider {
                     sql_stripped.clone()
                 };
 
-                // Build URL with auth and JSONCompact format.
-                let mut url = format!(
-                    "{}/?database={}&user={}&default_format=JSONCompact",
+                let url = format!(
+                    "{}/?database={}&default_format=JSONCompact",
                     base_url,
                     urlencoded(&database),
-                    urlencoded(&username),
                 );
-                if !password.is_empty() {
-                    url.push_str(&format!("&password={}", urlencoded(&password)));
-                }
 
                 let resp = match tokio::time::timeout(
                     crate::DATASOURCE_TIMEOUT_QUERY,
@@ -549,7 +545,8 @@ impl DatasourceProvider for ClickHouseProvider {
                     Ok(Err(e)) => {
                         let _ = tx
                             .send(Err(kyomi_connect_protocol::Error::Internal(format!(
-                                "ClickHouse HTTP request failed: {e}"
+                                "ClickHouse HTTP request failed: {}",
+                                e.without_url()
                             ))))
                             .await;
                         return;
@@ -1394,3 +1391,7 @@ mod tests {
         assert_eq!(urlencoded("tab\there"), "tab%09here");
     }
 }
+
+#[cfg(test)]
+#[path = "clickhouse/http_auth_tests.rs"]
+mod http_auth_tests;
