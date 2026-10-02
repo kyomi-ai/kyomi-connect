@@ -29,14 +29,20 @@
 //!   connect if the presented host key doesn't match.
 
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use russh::keys::PrivateKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Notify;
 
 use kyomi_connect_protocol::Error;
+
+// macOS sockaddr_un.sun_path is 104 bytes, including the terminating NUL.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Default SSH port.
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -54,6 +60,9 @@ pub struct SshTunnel {
     shutdown: Arc<Notify>,
     /// Handle to the background listener task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    unix_task_handle: Option<tokio::task::JoinHandle<()>>,
+    unix_socket_dir: Option<PathBuf>,
+    unix_socket_path: Option<PathBuf>,
 }
 
 impl SshTunnel {
@@ -172,7 +181,67 @@ impl SshTunnel {
             local_addr,
             shutdown,
             task_handle: Some(task_handle),
+            unix_task_handle: None,
+            unix_socket_dir: None,
+            unix_socket_path: None,
         })
+    }
+
+    /// Provide a local Unix socket for drivers that use one host field for both
+    /// TCP routing and TLS identity. The driver can keep the database hostname
+    /// while its transport goes through this socket and the SSH tunnel.
+    /// PostgreSQL expects `.s.PGSQL.<port>` inside a directory; MySQL takes
+    /// the socket path itself.
+    pub async fn bind_unix_socket(
+        &mut self,
+        database_port: u16,
+    ) -> kyomi_connect_protocol::Result<PathBuf> {
+        let dir = create_socket_directory(&std::env::temp_dir(), database_port)?;
+        let path = dir.join(format!(".s.PGSQL.{database_port}"));
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(Error::Internal(format!(
+                    "Failed to bind SSH tunnel socket: {e}"
+                )));
+            }
+        };
+        let local_addr = self.local_addr;
+        let shutdown = self.shutdown.clone();
+        self.unix_task_handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((mut stream, _)) => {
+                            tokio::spawn(async move {
+                                match tokio::net::TcpStream::connect(local_addr).await {
+                                    Ok(mut tcp) => {
+                                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "SSH tunnel socket relay failed"),
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!(error = %e, "SSH tunnel socket accept failed"),
+                    }
+                }
+            }
+        }));
+        self.unix_socket_dir = Some(dir);
+        self.unix_socket_path = Some(path.clone());
+        Ok(path)
+    }
+
+    /// Directory containing the PostgreSQL-compatible socket name.
+    pub fn unix_socket_dir(&self) -> Option<&std::path::Path> {
+        self.unix_socket_dir.as_deref()
+    }
+
+    /// Full socket path accepted by MySQL.
+    pub fn unix_socket_path(&self) -> Option<&std::path::Path> {
+        self.unix_socket_path.as_deref()
     }
 
     /// Returns the local address `("127.0.0.1", port)` that clients should
@@ -192,6 +261,22 @@ impl SshTunnel {
             // Give the task a moment to shut down
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
+        self.cleanup_unix_socket();
+    }
+
+    fn cleanup_unix_socket(&mut self) {
+        if let Some(handle) = self.unix_task_handle.take() {
+            handle.abort();
+        }
+        if let Some(dir) = self.unix_socket_dir.take() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            let _ = std::fs::remove_dir(dir);
+        }
+        self.unix_socket_path = None;
     }
 }
 
@@ -202,6 +287,7 @@ impl Drop for SshTunnel {
             tracing::warn!("SshTunnel dropped without calling close(), aborting background task");
             handle.abort();
         }
+        self.cleanup_unix_socket();
     }
 }
 
@@ -400,6 +486,38 @@ impl russh::client::Handler for TunnelClientHandler {
 /// digest is base64), so it is preserved.
 fn fingerprint_matches(expected: &str, actual: &str) -> bool {
     expected.trim() == actual.trim()
+}
+
+/// Create a private socket directory under a path short enough for macOS
+/// `sockaddr_un`. A long TMPDIR must not make every tunneled connection fail.
+fn create_socket_directory(
+    preferred_dir: &std::path::Path,
+    database_port: u16,
+) -> kyomi_connect_protocol::Result<PathBuf> {
+    let name = format!("kyomi-ssh-{}", uuid::Uuid::new_v4().simple());
+    let socket_name = format!(".s.PGSQL.{database_port}");
+    let mut last_error = None;
+    for base in [
+        preferred_dir,
+        std::path::Path::new("/tmp"),
+        std::path::Path::new("/var/tmp"),
+    ] {
+        let dir = base.join(&name);
+        let socket_path = dir.join(&socket_name);
+        if socket_path.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+            continue;
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(Error::Internal(format!(
+        "Failed to create short SSH tunnel socket directory: {}",
+        last_error.map_or_else(|| "no usable short path".to_string(), |e| e.to_string())
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -656,5 +774,234 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
     fn parse_private_key_unencrypted_garbage_still_errors_cleanly() {
         let result = SshTunnel::parse_private_key("not a key", None);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn unix_socket_forwards_to_tunnel_and_is_removed_on_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let mut tunnel = SshTunnel {
+            local_addr: addr,
+            shutdown: Arc::new(Notify::new()),
+            task_handle: None,
+            unix_task_handle: None,
+            unix_socket_dir: None,
+            unix_socket_path: None,
+        };
+        let path = tunnel.bind_unix_socket(5432).await.unwrap();
+        assert!(path.ends_with(".s.PGSQL.5432"));
+        assert_eq!(tunnel.unix_socket_path(), Some(path.as_path()));
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ping");
+        echo.await.unwrap();
+        drop(client);
+        drop(tunnel);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn long_temp_directory_falls_back_to_short_socket_path() {
+        let long_tmpdir = std::path::PathBuf::from(format!("/tmp/{}", "x".repeat(150)));
+        let dir = create_socket_directory(&long_tmpdir, 65535).unwrap();
+        let socket_path = dir.join(".s.PGSQL.65535");
+        assert!(socket_path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+        assert!(dir.starts_with("/tmp") || dir.starts_with("/var/tmp"));
+        assert!(!dir.starts_with(long_tmpdir));
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(feature = "clickhouse")]
+    #[tokio::test]
+    async fn reqwest_ip_literal_routes_through_unix_tunnel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut tunnel = SshTunnel {
+            local_addr: addr,
+            shutdown: Arc::new(Notify::new()),
+            task_handle: None,
+            unix_task_handle: None,
+            unix_socket_dir: None,
+            unix_socket_path: None,
+        };
+        let socket_path = tunnel.bind_unix_socket(8123).await.unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path.as_path())
+            .build()
+            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get("http://192.0.2.10:8123/path").send(),
+        )
+        .await
+        .expect("IP-literal request bypassed tunnel")
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert_eq!(body, "ok");
+        let request = server.await.unwrap();
+        assert!(request.contains("host: 192.0.2.10:8123"), "{request}");
+    }
+
+    #[cfg(feature = "clickhouse")]
+    #[tokio::test]
+    async fn reqwest_ip_literal_rejects_wrong_tls_identity_over_tunnel() {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let cert =
+            CertificateDer::from(include_bytes!("../tests/fixtures/tls/db.cert.der").to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/tls/db.key.der").to_vec(),
+        ));
+        let tls = TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            // The client must reach this server through the relay, then reject
+            // its db.example.test certificate for the 192.0.2.10 URL.
+            tls.accept(tcp).await.is_err()
+        });
+        let mut tunnel = SshTunnel {
+            local_addr: addr,
+            shutdown: Arc::new(Notify::new()),
+            task_handle: None,
+            unix_task_handle: None,
+            unix_socket_dir: None,
+            unix_socket_path: None,
+        };
+        let socket_path = tunnel.bind_unix_socket(8443).await.unwrap();
+        let ca =
+            reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/tls/db.cert.pem"))
+                .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path.as_path())
+            .add_root_certificate(ca)
+            .build()
+            .unwrap();
+        let (result, server_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(client.get("https://192.0.2.10:8443/").send(), server)
+            })
+            .await
+            .expect("TLS request did not reach tunneled server");
+        assert!(server_result.unwrap(), "TLS certificate was accepted");
+        let error = result.expect_err("IP certificate name must be checked");
+        assert!(
+            format!("{error:?}").contains("InvalidCertificate"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn postgres_tls_handshake(host: &str, trusted: bool) -> (bool, String) {
+        use sqlx::Connection;
+        use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/");
+        let cert =
+            CertificateDer::from(include_bytes!("../tests/fixtures/tls/db.cert.der").to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/tls/db.key.der").to_vec(),
+        ));
+        let tls = TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut ssl_request = [0; 8];
+            tcp.read_exact(&mut ssl_request).await.unwrap();
+            assert_eq!(ssl_request, [0, 0, 0, 8, 4, 210, 22, 47]);
+            tcp.write_all(b"S").await.unwrap();
+            tls.accept(tcp).await.is_ok()
+        });
+        let mut tunnel = SshTunnel {
+            local_addr: addr,
+            shutdown: Arc::new(Notify::new()),
+            task_handle: None,
+            unix_task_handle: None,
+            unix_socket_dir: None,
+            unix_socket_path: None,
+        };
+        tunnel.bind_unix_socket(5432).await.unwrap();
+        let mut options = PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .socket(tunnel.unix_socket_dir().unwrap())
+            .username("test")
+            .database("test")
+            .ssl_mode(PgSslMode::VerifyFull);
+        if trusted {
+            options = options.ssl_root_cert(format!("{fixture}db.cert.pem"));
+        }
+        let client = PgConnection::connect_with(&options);
+        let (client_result, server_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(client, server)
+            })
+            .await
+            .expect("TLS handshake timed out");
+        let error = client_result.expect_err("mock server does not complete login");
+        (server_result.unwrap(), error.to_string())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_tls_over_tunnel_validates_database_certificate_and_hostname() {
+        let (accepted, error) = postgres_tls_handshake("db.example.test", true).await;
+        assert!(accepted, "valid database certificate rejected: {error}");
+        let (accepted, error) = postgres_tls_handshake("other.example.test", true).await;
+        assert!(!accepted);
+        assert!(error.contains("not valid for name"), "{error}");
+        let (accepted, error) = postgres_tls_handshake("db.example.test", false).await;
+        assert!(!accepted);
+        assert!(error.contains("UnknownIssuer"), "{error}");
     }
 }

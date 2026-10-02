@@ -91,16 +91,13 @@ impl SqlServerProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
-        // When the `ssh` feature is enabled, these are reassigned to the tunnel endpoint.
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut host = connection_config
+        let host = connection_config
             .get("host")
             .and_then(|v| v.as_str())
             .unwrap_or("localhost")
             .to_string();
 
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut port = connection_config
+        let port = connection_config
             .get("port")
             .and_then(|v| v.as_u64())
             .map(|p| p as u16)
@@ -138,27 +135,17 @@ impl SqlServerProvider {
             Some(Ok(ssh_config)) => {
                 let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
 
-                let (tunnel_host, tunnel_port) = tunnel.local_addr();
-                host = tunnel_host.to_string();
-                port = tunnel_port;
-
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
             None => None,
         };
 
-        // When using SSH tunnel, disable encryption (tunnel provides encryption)
-        #[cfg(feature = "ssh")]
-        let effective_encrypt = if ssh_tunnel.is_some() { false } else { encrypt };
-        #[cfg(not(feature = "ssh"))]
-        let effective_encrypt = encrypt;
-
         tracing::info!(
             host = host,
             port = port,
             database = database,
-            encrypt = effective_encrypt,
+            encrypt = encrypt,
             trust_cert = trust_server_certificate,
             "Connecting to SQL Server"
         );
@@ -170,7 +157,7 @@ impl SqlServerProvider {
         config.database(&database);
         config.authentication(AuthMethod::sql_server(username, password));
 
-        if effective_encrypt {
+        if encrypt {
             config.encryption(EncryptionLevel::Required);
         } else {
             config.encryption(EncryptionLevel::NotSupported);
@@ -181,6 +168,15 @@ impl SqlServerProvider {
         }
 
         // Establish TCP connection
+        #[cfg(feature = "ssh")]
+        let addr = ssh_tunnel.as_ref().map_or_else(
+            || config.get_addr(),
+            |tunnel| {
+                let (host, port) = tunnel.local_addr();
+                format!("{host}:{port}")
+            },
+        );
+        #[cfg(not(feature = "ssh"))]
         let addr = config.get_addr();
         let tcp =
             tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, TcpStream::connect(&addr))

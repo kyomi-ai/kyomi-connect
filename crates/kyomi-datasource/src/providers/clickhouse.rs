@@ -90,16 +90,13 @@ impl ClickHouseProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
-        // When the `ssh` feature is enabled, these are reassigned to the tunnel endpoint.
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut host = connection_config
+        let host = connection_config
             .get("host")
             .and_then(|v| v.as_str())
             .unwrap_or("localhost")
             .to_string();
 
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut port = connection_config
+        let port = connection_config
             .get("port")
             .and_then(|v| v.as_u64())
             .map(|p| p as u16)
@@ -132,11 +129,8 @@ impl ClickHouseProvider {
         #[cfg(feature = "ssh")]
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
-                let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
-
-                let (tunnel_host, tunnel_port) = tunnel.local_addr();
-                host = tunnel_host.to_string();
-                port = tunnel_port;
+                let mut tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
+                tunnel.bind_unix_socket(port).await?;
 
                 Some(tunnel)
             }
@@ -144,22 +138,32 @@ impl ClickHouseProvider {
             None => None,
         };
 
-        // When using SSH tunnel, disable SSL (tunnel provides encryption)
-        #[cfg(feature = "ssh")]
-        let effective_secure = if ssh_tunnel.is_some() { false } else { secure };
-        #[cfg(not(feature = "ssh"))]
-        let effective_secure = secure;
-        let scheme = if effective_secure { "https" } else { "http" };
+        let scheme = if secure { "https" } else { "http" };
         let base_url = format!("{scheme}://{host}:{port}");
 
         tracing::info!(
             host = host,
             port = port,
             database = database,
-            secure = effective_secure,
+            secure = secure,
             "Connecting to ClickHouse"
         );
 
+        #[cfg(feature = "ssh")]
+        let client = if let Some(tunnel) = &ssh_tunnel {
+            reqwest::Client::builder()
+                .user_agent("Kyomi/1.0")
+                .no_proxy()
+                // DNS overrides are skipped for IP literals. A Unix socket
+                // forces every request through the SSH tunnel while the URL
+                // retains the original host for TLS identity and HTTP Host.
+                .unix_socket(tunnel.unix_socket_path().expect("socket bound"))
+                .build()
+                .map_err(|e| Error::Internal(format!("Failed to build ClickHouse client: {e}")))?
+        } else {
+            crate::http_client()?
+        };
+        #[cfg(not(feature = "ssh"))]
         let client = crate::http_client()?;
 
         // Query the server timezone to determine if DateTime strings are UTC.
