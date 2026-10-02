@@ -22,7 +22,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace -- -D warnings
+
+  cargo-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit locked dependencies against current advisories
+        run: cargo audit
 
   test:
     runs-on: ubuntu-latest
@@ -37,7 +51,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   feature-check:
     runs-on: ubuntu-latest
@@ -68,4 +82,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check feature ${{ matrix.feature }}
-        run: cargo check -p kyomi-datasource --no-default-features --features ${{ matrix.feature }}
+        run: cargo check --locked -p kyomi-datasource --no-default-features --features ${{ matrix.feature }}

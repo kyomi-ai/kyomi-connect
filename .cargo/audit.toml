@@ -1,0 +1,12 @@
+# cargo-audit reads this file automatically. Review every exception when updating
+# Cargo.lock; the audit CI job fetches current advisories on each run.
+# Last reviewed: 2026-09-27. Next review: 2026-10-27.
+[advisories]
+ignore = [
+    # Owner: Connect maintainers. Review by: 2026-10-27. Follow-up: KYO-855.
+    "RUSTSEC-2023-0071",
+
+    # Owner: Connect maintainers. Review by: 2026-10-27. Follow-up: KYO-212.
+    "RUSTSEC-2026-0154",
+    "RUSTSEC-2026-0153",
+]
