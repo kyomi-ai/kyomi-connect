@@ -145,6 +145,7 @@ jobs:
         id: crates-io-auth
 
       - name: Publish crates (skip already-published versions)
+        shell: bash
         run: |
           publish_if_new() {
             local crate="$1"
@@ -152,14 +153,21 @@ jobs:
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r ".packages[] | select(.name == \"$crate\") | .version")
 
-            echo "Publishing $crate@$version (skipping if already exists)..."
-            if cargo publish -p "$crate" 2>&1; then
-              echo "Published $crate@$version"
-              echo "Waiting for crates.io index update..."
-              sleep 30
-            else
-              echo "::notice::$crate@$version already published or publish failed — continuing"
+            # All three package names use the ky/om sparse-index prefix.
+            # A registry failure must fail the job, not look like an existing version.
+            local published
+            published=$(curl --fail --silent --show-error --retry 3 \
+              "https://index.crates.io/ky/om/$crate" \
+              | jq --slurp --arg version "$version" 'any(.[]; .vers == $version)')
+            if [[ "$published" == "true" ]]; then
+              echo "$crate@$version already published; skipping"
+              return
             fi
+
+            cargo publish --locked -p "$crate"
+            echo "Published $crate@$version"
+            echo "Waiting for crates.io index update..."
+            sleep 30
           }
 
           # Publish in dependency order
