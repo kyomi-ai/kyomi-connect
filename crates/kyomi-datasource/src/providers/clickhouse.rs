@@ -130,7 +130,7 @@ impl ClickHouseProvider {
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
                 let mut tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
-                tunnel.bind_unix_socket(port).await?;
+                tunnel.bind_http_proxy().await?;
 
                 Some(tunnel)
             }
@@ -154,10 +154,7 @@ impl ClickHouseProvider {
             reqwest::Client::builder()
                 .user_agent("Kyomi/1.0")
                 .no_proxy()
-                // DNS overrides are skipped for IP literals. A Unix socket
-                // forces every request through the SSH tunnel while the URL
-                // retains the original host for TLS identity and HTTP Host.
-                .unix_socket(tunnel.unix_socket_path().expect("socket bound"))
+                .proxy(tunnel.http_proxy()?)
                 .build()
                 .map_err(|e| Error::Internal(format!("Failed to build ClickHouse client: {e}")))?
         } else {

@@ -23,6 +23,8 @@ pub mod factory;
 pub mod oauth_refresh;
 pub mod provider;
 pub mod providers;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+mod sqlx;
 #[cfg(feature = "ssh")]
 pub mod ssh_tunnel;
 pub mod stream;

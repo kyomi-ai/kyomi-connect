@@ -5,6 +5,7 @@ members = [
     "crates/kyomi-datasource",
 ]
 resolver = "3"
+exclude = ["crates/kyomi-sqlx-postgres", "crates/kyomi-sqlx-mysql"]
 
 # Shared dependency versions — all crates use these
 [workspace.dependencies]
@@ -13,7 +14,9 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "normalize-path", "set-header", "trace"] }
 
 # Database drivers (optional, feature-gated)
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "uuid", "chrono", "json", "macros", "rust_decimal"] }
+sqlx-core = { version = "=0.8.6", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "uuid", "chrono", "json", "rust_decimal"] }
+kyomi-sqlx-postgres = { version = "=0.8.6", path = "crates/kyomi-sqlx-postgres", features = ["uuid", "chrono", "json", "rust_decimal"] }
+kyomi-sqlx-mysql = { version = "=0.8.6", path = "crates/kyomi-sqlx-mysql", features = ["uuid", "chrono", "json", "rust_decimal"] }
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
@@ -92,7 +95,7 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 
 # DataFusion (universal query engine, optional for adapter pattern)
 datafusion = { version = "52", default-features = false, features = ["sql"] }
-clickhouse = { version = "0.13", default-features = false }
+clickhouse = { version = "0.13", default-features = false, features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
 
 # Utilities
 anyhow = "1"
@@ -103,10 +106,13 @@ async-trait = "0.1.92"
 futures-util = "0.3"
 rand = "0.9"
 http = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "webpki-roots", "http1", "tls12"] }
+tower-service = "0.3"
 
 # Internal crates
 kyomi-connect-protocol = { version = "1.4.1", path = "crates/kyomi-connect-protocol" }
-kyomi-datasource = { version = "1.6.1", path = "crates/kyomi-datasource" }
+kyomi-datasource = { version = "1.6.2", path = "crates/kyomi-datasource" }
 
 [profile.release]
 opt-level = "z"

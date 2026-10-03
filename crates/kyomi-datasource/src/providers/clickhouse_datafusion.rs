@@ -80,16 +80,13 @@ impl DataFusionClickHouseProvider {
         connection_config: &Value,
         credentials: &Value,
     ) -> kyomi_connect_protocol::Result<Self> {
-        // When the `ssh` feature is enabled, these are reassigned to the tunnel endpoint.
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut host = connection_config
+        let host = connection_config
             .get("host")
             .and_then(|v| v.as_str())
             .unwrap_or("localhost")
             .to_string();
 
-        #[cfg_attr(not(feature = "ssh"), allow(unused_mut))]
-        let mut port = connection_config
+        let port = connection_config
             .get("port")
             .and_then(|v| v.as_u64())
             .map(|p| p as u16)
@@ -122,25 +119,29 @@ impl DataFusionClickHouseProvider {
             Some(Ok(ssh_config)) => {
                 let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
 
-                let (tunnel_host, tunnel_port) = tunnel.local_addr();
-                host = tunnel_host.to_string();
-                port = tunnel_port;
-
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
             None => None,
         };
 
-        // When using SSH tunnel, disable SSL (tunnel provides encryption)
-        #[cfg(feature = "ssh")]
-        let effective_secure = if ssh_tunnel.is_some() { false } else { secure };
-        #[cfg(not(feature = "ssh"))]
-        let effective_secure = secure;
-        let scheme = if effective_secure { "https" } else { "http" };
+        let scheme = if secure { "https" } else { "http" };
         let url = format!("{scheme}://{host}:{port}");
 
-        let client = Client::default()
+        #[cfg(feature = "ssh")]
+        let client = if let Some(tunnel) = &ssh_tunnel {
+            let connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(TunnelConnector(tunnel.transport_addr()));
+            native_tunnel_client(connector)
+        } else {
+            Client::default()
+        };
+        #[cfg(not(feature = "ssh"))]
+        let client = Client::default();
+        let client = client
             .with_url(&url)
             .with_user(username)
             .with_password(password)
@@ -406,6 +407,44 @@ impl DatasourceProvider for DataFusionClickHouseProvider {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Only chooses the dial endpoint; the outer HTTPS connector sees the original URI.
+#[cfg(feature = "ssh")]
+#[derive(Clone)]
+struct TunnelConnector(std::net::SocketAddr);
+
+#[cfg(feature = "ssh")]
+impl tower_service::Service<http::Uri> for TunnelConnector {
+    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: http::Uri) -> Self::Future {
+        let addr = self.0;
+        Box::pin(async move {
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .map(hyper_util::rt::TokioIo::new)
+        })
+    }
+}
+
+#[cfg(feature = "ssh")]
+fn native_tunnel_client(connector: hyper_rustls::HttpsConnector<TunnelConnector>) -> Client {
+    Client::with_http_client(
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(connector),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +576,89 @@ mod tests {
         // When limit is None, has_more should be false.
         let limit: Option<u32> = None;
         assert!(!limit.map_or(false, |l| row_count == l as u64));
+    }
+}
+
+#[cfg(all(test, feature = "ssh"))]
+mod portable_transport_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{
+            ClientConfig, RootCertStore, ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
+        },
+    };
+
+    #[tokio::test]
+    async fn native_tunnel_tls_retains_uri_identity_and_trust() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        for (host, trusted, expected) in [
+            ("db.example.test", true, true),
+            ("other.example.test", true, false),
+            ("db.example.test", false, false),
+            ("192.0.2.10", true, false),
+        ] {
+            let cert = CertificateDer::from(
+                include_bytes!("../../tests/fixtures/tls/db.cert.der").to_vec(),
+            );
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                include_bytes!("../../tests/fixtures/tls/db.key.der").to_vec(),
+            ));
+            let tls = TlsAcceptor::from(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert.clone()], key)
+                    .unwrap(),
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                match tls.accept(tcp).await {
+                    Ok(mut stream) => {
+                        let mut request = [0; 4096];
+                        assert!(stream.read(&mut request).await.unwrap() > 0);
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+            let mut roots = RootCertStore::empty();
+            if trusted {
+                roots
+                    .add(
+                        CertificateDer::from_pem_slice(include_bytes!(
+                            "../../tests/fixtures/tls/db.cert.pem"
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(config)
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(TunnelConnector(addr));
+            let client = native_tunnel_client(connector).with_url(format!("https://{host}:8443"));
+            let (result, accepted) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(client.query("SELECT 1").execute(), server)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                accepted.unwrap(),
+                expected,
+                "host={host}, trusted={trusted}, result={result:?}"
+            );
+            assert_eq!(result.is_ok(), expected, "{result:?}");
+        }
     }
 }

@@ -29,19 +29,25 @@
 //!   connect if the presented host key doesn't match.
 
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use russh::keys::PrivateKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
 use kyomi_connect_protocol::Error;
 
 // macOS sockaddr_un.sun_path is 104 bytes, including the terminating NUL.
+#[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Default SSH port.
@@ -60,9 +66,10 @@ pub struct SshTunnel {
     shutdown: Arc<Notify>,
     /// Handle to the background listener task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    unix_task_handle: Option<tokio::task::JoinHandle<()>>,
-    unix_socket_dir: Option<PathBuf>,
-    unix_socket_path: Option<PathBuf>,
+    proxy_task_handle: Option<tokio::task::JoinHandle<()>>,
+    proxy_addr: Option<SocketAddr>,
+    #[cfg(unix)]
+    unix_socket: Option<UnixSocketRelay>,
 }
 
 impl SshTunnel {
@@ -181,23 +188,29 @@ impl SshTunnel {
             local_addr,
             shutdown,
             task_handle: Some(task_handle),
-            unix_task_handle: None,
-            unix_socket_dir: None,
-            unix_socket_path: None,
+            proxy_task_handle: None,
+            proxy_addr: None,
+            #[cfg(unix)]
+            unix_socket: None,
         })
     }
 
-    /// Provide a local Unix socket for drivers that use one host field for both
-    /// TCP routing and TLS identity. The driver can keep the database hostname
-    /// while its transport goes through this socket and the SSH tunnel.
-    /// PostgreSQL expects `.s.PGSQL.<port>` inside a directory; MySQL takes
-    /// the socket path itself.
+    /// Provide a PostgreSQL-compatible Unix socket for existing Unix callers.
+    /// The socket relays through this tunnel while the driver retains its TLS host.
+    /// Portable datasource providers use [`Self::transport_addr`] instead.
+    #[cfg(unix)]
     pub async fn bind_unix_socket(
         &mut self,
         database_port: u16,
     ) -> kyomi_connect_protocol::Result<PathBuf> {
+        let socket_name = format!(".s.PGSQL.{database_port}");
+        if let Some(socket) = &self.unix_socket
+            && socket.path.file_name() == Some(std::ffi::OsStr::new(&socket_name))
+        {
+            return Ok(socket.path.clone());
+        }
         let dir = create_socket_directory(&std::env::temp_dir(), database_port)?;
-        let path = dir.join(format!(".s.PGSQL.{database_port}"));
+        let path = dir.join(socket_name);
         let listener = match UnixListener::bind(&path) {
             Ok(listener) => listener,
             Err(e) => {
@@ -207,16 +220,18 @@ impl SshTunnel {
                 )));
             }
         };
-        let local_addr = self.local_addr;
+        let target = self.local_addr;
         let shutdown = self.shutdown.clone();
-        self.unix_task_handle = Some(tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = shutdown.notified() => break,
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {},
                     accepted = listener.accept() => match accepted {
                         Ok((mut stream, _)) => {
-                            tokio::spawn(async move {
-                                match tokio::net::TcpStream::connect(local_addr).await {
+                            connections.spawn(async move {
+                                match tokio::net::TcpStream::connect(target).await {
                                     Ok(mut tcp) => {
                                         let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
                                     }
@@ -224,24 +239,91 @@ impl SshTunnel {
                                 }
                             });
                         }
-                        Err(e) => tracing::warn!(error = %e, "SSH tunnel socket accept failed"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SSH tunnel socket accept failed");
+                            break;
+                        }
                     }
                 }
             }
-        }));
-        self.unix_socket_dir = Some(dir);
-        self.unix_socket_path = Some(path.clone());
+            connections.shutdown().await;
+        });
+        self.unix_socket = Some(UnixSocketRelay {
+            task_handle: Some(task_handle),
+            dir,
+            path: path.clone(),
+        });
         Ok(path)
     }
 
     /// Directory containing the PostgreSQL-compatible socket name.
+    #[cfg(unix)]
     pub fn unix_socket_dir(&self) -> Option<&std::path::Path> {
-        self.unix_socket_dir.as_deref()
+        self.unix_socket.as_ref().map(|socket| socket.dir.as_path())
     }
 
     /// Full socket path accepted by MySQL.
+    #[cfg(unix)]
     pub fn unix_socket_path(&self) -> Option<&std::path::Path> {
-        self.unix_socket_path.as_deref()
+        self.unix_socket
+            .as_ref()
+            .map(|socket| socket.path.as_path())
+    }
+
+    /// TCP dial endpoint, independent of the database TLS identity.
+    pub fn transport_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Bind a private HTTP proxy that sends requests only to this tunnel.
+    /// HTTPS uses CONNECT so the HTTP client verifies the original URL host,
+    /// including IP literals, without DNS overrides or platform-specific sockets.
+    pub async fn bind_http_proxy(&mut self) -> kyomi_connect_protocol::Result<SocketAddr> {
+        if let Some(addr) = self.proxy_addr {
+            return Ok(addr);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to bind SSH HTTP proxy: {e}")))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| Error::Internal(format!("Failed to read SSH HTTP proxy address: {e}")))?;
+        let target = self.local_addr;
+        let shutdown = self.shutdown.clone();
+        self.proxy_task_handle = Some(tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => break,
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {},
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            connections.spawn(async move {
+                                if let Err(e) = proxy_connection(stream, target).await {
+                                    tracing::debug!(error = %e, "SSH HTTP proxy connection ended");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SSH HTTP proxy accept failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            connections.shutdown().await;
+        }));
+        self.proxy_addr = Some(addr);
+        Ok(addr)
+    }
+
+    /// Explicit proxy configuration excludes environment/system proxy settings.
+    pub fn http_proxy(&self) -> kyomi_connect_protocol::Result<reqwest::Proxy> {
+        let addr = self
+            .proxy_addr
+            .ok_or_else(|| Error::Internal("SSH HTTP proxy not bound".into()))?;
+        reqwest::Proxy::all(format!("http://{addr}"))
+            .map_err(|e| Error::Internal(format!("Invalid SSH HTTP proxy: {e}")))
     }
 
     /// Returns the local address `("127.0.0.1", port)` that clients should
@@ -257,26 +339,23 @@ impl SshTunnel {
         tracing::info!("Closing SSH tunnel on 127.0.0.1:{}", self.local_addr.port());
         self.shutdown.notify_waiters();
 
-        if let Some(handle) = self.task_handle.take() {
-            // Give the task a moment to shut down
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        }
-        self.cleanup_unix_socket();
-    }
-
-    fn cleanup_unix_socket(&mut self) {
-        if let Some(handle) = self.unix_task_handle.take() {
+        if let Some(mut handle) = self.task_handle.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+        {
             handle.abort();
+            let _ = handle.await;
         }
-        if let Some(dir) = self.unix_socket_dir.take() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-            let _ = std::fs::remove_dir(dir);
+        if let Some(handle) = self.proxy_task_handle.take() {
+            handle.abort();
+            let _ = handle.await;
         }
-        self.unix_socket_path = None;
+        self.proxy_addr = None;
+        #[cfg(unix)]
+        if let Some(mut socket) = self.unix_socket.take() {
+            socket.close().await;
+        }
     }
 }
 
@@ -287,7 +366,38 @@ impl Drop for SshTunnel {
             tracing::warn!("SshTunnel dropped without calling close(), aborting background task");
             handle.abort();
         }
-        self.cleanup_unix_socket();
+        if let Some(handle) = self.proxy_task_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Own the compatibility listener and its private filesystem paths together.
+#[cfg(unix)]
+struct UnixSocketRelay {
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixSocketRelay {
+    async fn close(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketRelay {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
     }
 }
 
@@ -320,8 +430,10 @@ impl SshTunnel {
         target_port: u16,
         shutdown: Arc<Notify>,
     ) {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 _ = shutdown.notified() => {
                     tracing::debug!("SSH tunnel listener shutting down");
                     break;
@@ -335,7 +447,7 @@ impl SshTunnel {
                             );
                             let ssh = ssh_handle.clone();
                             let host = target_host.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 if let Err(e) = Self::forward_connection(
                                     tcp_stream, ssh, &host, target_port, peer_addr,
                                 ).await {
@@ -488,8 +600,75 @@ fn fingerprint_matches(expected: &str, actual: &str) -> bool {
     expected.trim() == actual.trim()
 }
 
+/// Read a bounded proxy request header without consuming any tunneled TLS bytes.
+async fn proxy_connection(
+    mut stream: tokio::net::TcpStream,
+    target: SocketAddr,
+) -> std::io::Result<()> {
+    let mut header = Vec::new();
+    tokio::time::timeout(crate::DATASOURCE_TIMEOUT_CONNECT, async {
+        while !header.ends_with(b"\r\n\r\n") {
+            if header.len() >= 16 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP proxy header too large",
+                ));
+            }
+            header.push(stream.read_u8().await?);
+        }
+        Ok(())
+    })
+    .await??;
+    let mut upstream = tokio::net::TcpStream::connect(target).await?;
+    if header.starts_with(b"CONNECT ") {
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+    } else {
+        // HTTP proxy requests use absolute URLs. Send origin-form to the database.
+        let line_end = header
+            .windows(2)
+            .position(|b| b == b"\r\n")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid HTTP request")
+            })?;
+        let line = std::str::from_utf8(&header[..line_end])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let url = reqwest::Url::parse(parts.next().unwrap_or(""))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let version = parts.next().unwrap_or("");
+        let mut path = url.path().to_string();
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        upstream
+            .write_all(format!("{method} {path} {version}").as_bytes())
+            .await?;
+        // Use one HTTP request per connection: subsequent proxy requests would
+        // otherwise arrive in absolute-form after this origin-form rewrite.
+        upstream.write_all(b"\r\nConnection: close\r\n").await?;
+        for line in header[line_end + 2..header.len() - 4].split(|b| *b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let name = line.split(|b| *b == b':').next().unwrap_or_default();
+            if !name.eq_ignore_ascii_case(b"connection")
+                && !name.eq_ignore_ascii_case(b"proxy-connection")
+            {
+                upstream.write_all(line).await?;
+                upstream.write_all(b"\r\n").await?;
+            }
+        }
+        upstream.write_all(b"\r\n").await?;
+    }
+    tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    Ok(())
+}
+
 /// Create a private socket directory under a path short enough for macOS
 /// `sockaddr_un`. A long TMPDIR must not make every tunneled connection fail.
+#[cfg(unix)]
 fn create_socket_directory(
     preferred_dir: &std::path::Path,
     database_port: u16,
@@ -776,53 +955,9 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn unix_socket_forwards_to_tunnel_and_is_removed_on_drop() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let echo = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = [0; 4];
-            stream.read_exact(&mut bytes).await.unwrap();
-            stream.write_all(&bytes).await.unwrap();
-        });
-        let mut tunnel = SshTunnel {
-            local_addr: addr,
-            shutdown: Arc::new(Notify::new()),
-            task_handle: None,
-            unix_task_handle: None,
-            unix_socket_dir: None,
-            unix_socket_path: None,
-        };
-        let path = tunnel.bind_unix_socket(5432).await.unwrap();
-        assert!(path.ends_with(".s.PGSQL.5432"));
-        assert_eq!(tunnel.unix_socket_path(), Some(path.as_path()));
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        client.write_all(b"ping").await.unwrap();
-        let mut response = [0; 4];
-        client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"ping");
-        echo.await.unwrap();
-        drop(client);
-        drop(tunnel);
-        assert!(!path.exists());
-        assert!(!path.parent().unwrap().exists());
-    }
-
-    #[test]
-    fn long_temp_directory_falls_back_to_short_socket_path() {
-        let long_tmpdir = std::path::PathBuf::from(format!("/tmp/{}", "x".repeat(150)));
-        let dir = create_socket_directory(&long_tmpdir, 65535).unwrap();
-        let socket_path = dir.join(".s.PGSQL.65535");
-        assert!(socket_path.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
-        assert!(dir.starts_with("/tmp") || dir.starts_with("/var/tmp"));
-        assert!(!dir.starts_with(long_tmpdir));
-        std::fs::remove_dir(dir).unwrap();
-    }
-
     #[cfg(feature = "clickhouse")]
     #[tokio::test]
-    async fn reqwest_ip_literal_routes_through_unix_tunnel() {
+    async fn reqwest_ip_literal_routes_through_tcp_proxy() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -847,14 +982,15 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             local_addr: addr,
             shutdown: Arc::new(Notify::new()),
             task_handle: None,
-            unix_task_handle: None,
-            unix_socket_dir: None,
-            unix_socket_path: None,
+            proxy_task_handle: None,
+            proxy_addr: None,
+            #[cfg(unix)]
+            unix_socket: None,
         };
-        let socket_path = tunnel.bind_unix_socket(8123).await.unwrap();
+        tunnel.bind_http_proxy().await.unwrap();
         let client = reqwest::Client::builder()
             .no_proxy()
-            .unix_socket(socket_path.as_path())
+            .proxy(tunnel.http_proxy().unwrap())
             .build()
             .unwrap();
         let body = tokio::time::timeout(
@@ -869,7 +1005,16 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         .unwrap();
         assert_eq!(body, "ok");
         let request = server.await.unwrap();
-        assert!(request.contains("host: 192.0.2.10:8123"), "{request}");
+        assert_eq!(request.lines().next(), Some("GET /path HTTP/1.1"));
+        let headers = request.to_ascii_lowercase();
+        assert!(
+            headers.lines().any(|line| line == "host: 192.0.2.10:8123"),
+            "{request}"
+        );
+        assert!(
+            headers.lines().any(|line| line == "connection: close"),
+            "{request}"
+        );
     }
 
     #[cfg(feature = "clickhouse")]
@@ -903,17 +1048,18 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             local_addr: addr,
             shutdown: Arc::new(Notify::new()),
             task_handle: None,
-            unix_task_handle: None,
-            unix_socket_dir: None,
-            unix_socket_path: None,
+            proxy_task_handle: None,
+            proxy_addr: None,
+            #[cfg(unix)]
+            unix_socket: None,
         };
-        let socket_path = tunnel.bind_unix_socket(8443).await.unwrap();
+        tunnel.bind_http_proxy().await.unwrap();
         let ca =
             reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/tls/db.cert.pem"))
                 .unwrap();
         let client = reqwest::Client::builder()
             .no_proxy()
-            .unix_socket(socket_path.as_path())
+            .proxy(tunnel.http_proxy().unwrap())
             .add_root_certificate(ca)
             .build()
             .unwrap();
@@ -933,8 +1079,8 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
 
     #[cfg(feature = "postgres")]
     async fn postgres_tls_handshake(host: &str, trusted: bool) -> (bool, String) {
-        use sqlx::Connection;
-        use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+        use crate::sqlx::Connection;
+        use crate::sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
         use tokio_rustls::TlsAcceptor;
         use tokio_rustls::rustls::ServerConfig;
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -962,19 +1108,19 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             tcp.write_all(b"S").await.unwrap();
             tls.accept(tcp).await.is_ok()
         });
-        let mut tunnel = SshTunnel {
+        let tunnel = SshTunnel {
             local_addr: addr,
             shutdown: Arc::new(Notify::new()),
             task_handle: None,
-            unix_task_handle: None,
-            unix_socket_dir: None,
-            unix_socket_path: None,
+            proxy_task_handle: None,
+            proxy_addr: None,
+            #[cfg(unix)]
+            unix_socket: None,
         };
-        tunnel.bind_unix_socket(5432).await.unwrap();
         let mut options = PgConnectOptions::new()
             .host(host)
             .port(5432)
-            .socket(tunnel.unix_socket_dir().unwrap())
+            .transport_addr(tunnel.transport_addr())
             .username("test")
             .database("test")
             .ssl_mode(PgSslMode::VerifyFull);
@@ -1003,5 +1149,422 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         let (accepted, error) = postgres_tls_handshake("db.example.test", false).await;
         assert!(!accepted);
         assert!(error.contains("UnknownIssuer"), "{error}");
+    }
+
+    fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let cert =
+            CertificateDer::from(include_bytes!("../tests/fixtures/tls/db.cert.der").to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/tls/db.key.der").to_vec(),
+        ));
+        tokio_rustls::TlsAcceptor::from(Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        ))
+    }
+
+    fn test_tunnel(addr: SocketAddr) -> SshTunnel {
+        SshTunnel {
+            local_addr: addr,
+            shutdown: Arc::new(Notify::new()),
+            task_handle: None,
+            proxy_task_handle: None,
+            proxy_addr: None,
+            #[cfg(unix)]
+            unix_socket: None,
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    async fn mysql_tls_handshake(
+        host: &str,
+        trusted: bool,
+        mode: crate::sqlx::mysql::MySqlSslMode,
+    ) -> (bool, String) {
+        use crate::sqlx::{
+            Connection,
+            mysql::{MySqlConnectOptions, MySqlConnection},
+        };
+        let tls = tls_acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            // MySQL 8.0 greeting from the upstream SQLx protocol test fixture.
+            let greeting = b"\n8.0.18\x00\x19\x00\x00\x00\x114aB0c\x06g\x00\xff\xff\xff\x02\x00\xff\xc7\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00tL\x03s\x0f[4\rl4. \x00caching_sha2_password\x00";
+            let len = greeting.len() as u32;
+            let mut packet = len.to_le_bytes().to_vec();
+            packet[3] = 0; // initial sequence ID
+            packet.extend_from_slice(greeting);
+            tcp.write_all(&packet).await.unwrap();
+            let mut header = [0; 4];
+            tcp.read_exact(&mut header).await.unwrap();
+            assert_eq!(header, [32, 0, 0, 1]);
+            let mut ssl_request = [0; 32];
+            tcp.read_exact(&mut ssl_request).await.unwrap();
+            assert_ne!(
+                u32::from_le_bytes(ssl_request[..4].try_into().unwrap()) & 0x800,
+                0
+            );
+            tls.accept(tcp).await.is_ok()
+        });
+        let tunnel = test_tunnel(addr);
+        let mut options = MySqlConnectOptions::new()
+            .host(host)
+            .port(3306)
+            .transport_addr(tunnel.transport_addr())
+            .username("test")
+            .ssl_mode(mode);
+        if trusted {
+            options = options.ssl_ca(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/tls/db.cert.pem"
+            ));
+        }
+        let (result, accepted) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(MySqlConnection::connect_with(&options), server)
+        })
+        .await
+        .expect("MySQL TLS handshake timed out");
+        (
+            accepted.unwrap(),
+            result
+                .expect_err("fixture ends after TLS handshake")
+                .to_string(),
+        )
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn mysql_tls_over_tunnel_preserves_identity_and_configured_modes() {
+        use crate::sqlx::mysql::MySqlSslMode;
+        let (accepted, error) =
+            mysql_tls_handshake("db.example.test", true, MySqlSslMode::VerifyIdentity).await;
+        assert!(accepted, "{error}");
+        let (accepted, error) =
+            mysql_tls_handshake("other.example.test", true, MySqlSslMode::VerifyIdentity).await;
+        assert!(!accepted, "{error}");
+        assert!(error.contains("not valid for name"), "{error}");
+        let (accepted, error) =
+            mysql_tls_handshake("db.example.test", false, MySqlSslMode::VerifyIdentity).await;
+        assert!(!accepted, "{error}");
+        assert!(error.contains("UnknownIssuer"), "{error}");
+        let (accepted, error) =
+            mysql_tls_handshake("db.example.test", true, MySqlSslMode::VerifyCa).await;
+        assert!(
+            accepted,
+            "configured VerifyCa must accept the trusted database: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_proxy_tls_preserves_original_identity_and_trust() {
+        for (host, trusted, expected) in [
+            ("db.example.test", true, true),
+            ("other.example.test", true, false),
+            ("db.example.test", false, false),
+            ("192.0.2.10", true, false),
+        ] {
+            let tls = tls_acceptor();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut tunnel = test_tunnel(listener.local_addr().unwrap());
+            tunnel.bind_http_proxy().await.unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                match tls.accept(tcp).await {
+                    Ok(mut stream) => {
+                        let mut request = [0; 4096];
+                        let n = stream.read(&mut request).await.unwrap();
+                        assert!(n > 0);
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(tunnel.http_proxy().unwrap());
+            if trusted {
+                builder = builder.add_root_certificate(
+                    reqwest::Certificate::from_pem(include_bytes!(
+                        "../tests/fixtures/tls/db.cert.pem"
+                    ))
+                    .unwrap(),
+                );
+            }
+            let client = builder.build().unwrap();
+            let (response, accepted) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(client.get(format!("https://{host}:8443/")).send(), server)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                accepted.unwrap(),
+                expected,
+                "host={host}, trusted={trusted}, response={response:?}"
+            );
+            assert_eq!(response.is_ok(), expected);
+            if expected {
+                assert_eq!(response.unwrap().text().await.unwrap(), "ok");
+            }
+            tunnel.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn http_proxy_close_and_drop_release_listener_and_active_connections() {
+        for close in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut tunnel = test_tunnel(listener.local_addr().unwrap());
+            let proxy = tunnel.bind_http_proxy().await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            client
+                .write_all(
+                    b"CONNECT db.example.test:443 HTTP/1.1\r\nHost: db.example.test:443\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            let mut header = [0; 39];
+            client.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+            client.write_all(b"ping").await.unwrap();
+            let mut ping = [0; 4];
+            upstream.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            if close {
+                tunnel.close().await;
+            }
+            drop(tunnel);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut byte = [0; 1];
+                assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+                assert!(tokio::net::TcpStream::connect(proxy).await.is_err());
+            })
+            .await
+            .expect("proxy tasks must stop on close and drop");
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestBastion {
+        target: SocketAddr,
+        public_key: russh::keys::PublicKey,
+    }
+
+    impl russh::server::Server for TestBastion {
+        type Handler = Self;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> Self {
+            self.clone()
+        }
+    }
+
+    impl russh::server::Handler for TestBastion {
+        type Error = russh::Error;
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            key: &russh::keys::PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            if key.key_data() == self.public_key.key_data() {
+                Ok(russh::server::Auth::Accept)
+            } else {
+                Ok(russh::server::Auth::reject())
+            }
+        }
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            host: &str,
+            port: u32,
+            _: &str,
+            _: u32,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            assert_eq!(host, "db.example.test");
+            assert_eq!(port, 5432);
+            let mut tcp = tokio::net::TcpStream::connect(self.target).await?;
+            tokio::spawn(async move {
+                let mut channel = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut channel, &mut tcp).await;
+            });
+            Ok(true)
+        }
+    }
+
+    async fn real_ssh_tunnel(target: SocketAddr) -> (SshTunnel, tokio::task::JoinHandle<()>) {
+        use russh::server::Server;
+        let key = SshTunnel::parse_private_key(ENCRYPTED_ED25519_KEY, Some("hunter42")).unwrap();
+        let fingerprint = key
+            .public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        let public_key = key.public_key().clone();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            ..Default::default()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut server = TestBastion { target, public_key };
+            server.run_on_socket(config, &listener).await.unwrap();
+        });
+        let config = SshTunnelConfig {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port,
+            username: "test".into(),
+            private_key: ENCRYPTED_ED25519_KEY.into(),
+            passphrase: Some("hunter42".into()),
+            host_fingerprint: Some(fingerprint),
+        };
+        let tunnel = SshTunnel::connect(&config, "db.example.test", 5432)
+            .await
+            .unwrap();
+        (tunnel, server)
+    }
+
+    #[tokio::test]
+    async fn real_ssh_forwarding_close_and_drop_stop_active_channels() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            for close in [true, false] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let (mut tunnel, server) = real_ssh_tunnel(listener.local_addr().unwrap()).await;
+                let addr = tunnel.transport_addr();
+                let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+                client.write_all(b"ping").await.unwrap();
+                let (mut upstream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4];
+                upstream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"ping");
+                upstream.write_all(b"pong").await.unwrap();
+                client.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"pong");
+                if close {
+                    tunnel.close().await;
+                }
+                drop(tunnel);
+                let mut byte = [0; 1];
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+                assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+                assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+                server.abort();
+                let _ = server.await;
+            }
+        })
+        .await
+        .expect("SSH listener and active channels must terminate on close and drop");
+    }
+
+    #[tokio::test]
+    async fn real_ssh_http_proxy_preserves_database_tls_identity() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (mut tunnel, bastion) = real_ssh_tunnel(listener.local_addr().unwrap()).await;
+            tunnel.bind_http_proxy().await.unwrap();
+            let tls = tls_acceptor();
+            let database = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = tls.accept(tcp).await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let ca =
+                reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/tls/db.cert.pem"))
+                    .unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(tunnel.http_proxy().unwrap())
+                .add_root_certificate(ca)
+                .build()
+                .unwrap();
+            let response = client
+                .get("https://db.example.test:5432/")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            database.await.unwrap();
+            tunnel.close().await;
+            bastion.abort();
+            let _ = bastion.await;
+        })
+        .await
+        .expect("TLS must complete over the real SSH direct-tcpip channel");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_compatibility_apis_forward_and_cleanup_on_close_and_drop() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for close in [true, false] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut tunnel = test_tunnel(listener.local_addr().unwrap());
+                // Explicit types protect the published 1.6.1 Unix API signatures.
+                let path: PathBuf = tunnel.bind_unix_socket(5432).await.unwrap();
+                let socket_path: Option<&std::path::Path> = tunnel.unix_socket_path();
+                let socket_dir: Option<&std::path::Path> = tunnel.unix_socket_dir();
+                assert_eq!(socket_path, Some(path.as_path()));
+                let dir = socket_dir.unwrap().to_owned();
+                assert_eq!(path, dir.join(".s.PGSQL.5432"));
+                assert_eq!(tunnel.bind_unix_socket(5432).await.unwrap(), path);
+                let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+                client.write_all(b"ping").await.unwrap();
+                let (mut upstream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4];
+                upstream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"ping");
+                upstream.write_all(b"pong").await.unwrap();
+                client.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"pong");
+                if close {
+                    tunnel.close().await;
+                    assert!(tunnel.unix_socket_path().is_none());
+                    assert!(tunnel.unix_socket_dir().is_none());
+                }
+                drop(tunnel);
+                let mut byte = [0; 1];
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+                assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+                assert!(!path.exists());
+                assert!(!dir.exists());
+            }
+        })
+        .await
+        .expect("Unix compatibility listener and active relays must terminate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_compatibility_uses_short_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let long_tmpdir = PathBuf::from(format!("/tmp/{}", "x".repeat(150)));
+        let dir = create_socket_directory(&long_tmpdir, 65535).unwrap();
+        assert!(
+            dir.join(".s.PGSQL.65535").as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!dir.starts_with(long_tmpdir));
+        std::fs::remove_dir(dir).unwrap();
     }
 }
