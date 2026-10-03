@@ -39,6 +39,7 @@
 //! | `access_key_id` | string | AWS access key (optional, uses default credentials if omitted) |
 //! | `secret_access_key` | string | AWS secret key (optional) |
 
+use crate::sqlx;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -135,8 +136,7 @@ impl RedshiftProvider {
         #[cfg(feature = "ssh")]
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
-                let mut tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
-                tunnel.bind_unix_socket(port).await?;
+                let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
@@ -164,8 +164,7 @@ impl RedshiftProvider {
 
         #[cfg(feature = "ssh")]
         if let Some(tunnel) = &ssh_tunnel {
-            connect_options =
-                connect_options.socket(tunnel.unix_socket_dir().expect("socket bound"));
+            connect_options = connect_options.transport_addr(tunnel.transport_addr());
         }
 
         // If a CA certificate path is specified, tell sqlx to use it for

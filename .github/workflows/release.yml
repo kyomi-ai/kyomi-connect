@@ -150,10 +150,11 @@ jobs:
           publish_if_new() {
             local crate="$1"
             local version
-            version=$(cargo metadata --no-deps --format-version 1 \
+            version=$(cargo metadata --manifest-path "crates/$crate/Cargo.toml" \
+              --no-deps --format-version 1 \
               | jq -r ".packages[] | select(.name == \"$crate\") | .version")
 
-            # All three package names use the ky/om sparse-index prefix.
+            # All package names use the ky/om sparse-index prefix.
             # A registry failure must fail the job, not look like an existing version.
             local published
             published=$(curl --fail --silent --show-error --retry 3 \
@@ -164,7 +165,7 @@ jobs:
               return
             fi
 
-            cargo publish --locked -p "$crate"
+            cargo publish --locked --manifest-path "crates/$crate/Cargo.toml"
             echo "Published $crate@$version"
             echo "Waiting for crates.io index update..."
             sleep 30
@@ -172,6 +173,10 @@ jobs:
 
           # Publish in dependency order
           publish_if_new kyomi-connect-protocol
+          # New driver names must first be bootstrapped with a crates.io API token
+          # and configured to trust this workflow; OIDC cannot create a new crate.
+          publish_if_new kyomi-sqlx-postgres
+          publish_if_new kyomi-sqlx-mysql
           publish_if_new kyomi-datasource
           publish_if_new kyomi-connect
         env:

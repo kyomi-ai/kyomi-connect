@@ -24,6 +24,7 @@
 //! | `username` | string | MySQL username |
 //! | `password` | string | MySQL password |
 
+use crate::sqlx;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -109,8 +110,7 @@ impl MySqlProvider {
         #[cfg(feature = "ssh")]
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
-                let mut tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
-                tunnel.bind_unix_socket(port).await?;
+                let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
@@ -138,8 +138,7 @@ impl MySqlProvider {
 
         #[cfg(feature = "ssh")]
         if let Some(tunnel) = &ssh_tunnel {
-            connect_options =
-                connect_options.socket(tunnel.unix_socket_path().expect("socket bound"));
+            connect_options = connect_options.transport_addr(tunnel.transport_addr());
         }
 
         // For verify-ca / verify-full, attach the CA certificate if provided

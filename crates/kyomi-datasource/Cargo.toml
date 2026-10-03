@@ -1,6 +1,6 @@
 [package]
 name = "kyomi-datasource"
-version = "1.6.1"
+version = "1.6.2"
 edition = "2024"
 description = "Database provider implementations for Kyomi Connect"
 license = "Apache-2.0"
@@ -11,9 +11,9 @@ homepage = "https://kyomi.ai"
 default = ["all"]
 all = ["postgres", "mysql", "redshift", "clickhouse", "snowflake",
        "databricks", "sqlserver", "synapse", "bigquery", "flaredb", "ssh"]
-postgres = ["dep:sqlx"]
-mysql = ["dep:sqlx"]
-redshift = ["dep:sqlx", "postgres"]
+postgres = ["dep:sqlx-core", "dep:kyomi-sqlx-postgres"]
+mysql = ["dep:sqlx-core", "dep:kyomi-sqlx-mysql"]
+redshift = ["postgres"]
 clickhouse = []
 snowflake = ["dep:jsonwebtoken", "dep:rsa"]
 databricks = []
@@ -22,7 +22,7 @@ synapse = ["dep:tiberius", "dep:tokio-util"]
 bigquery = ["dep:jsonwebtoken"]
 flaredb = ["dep:arrow-flight", "dep:tonic"]
 ssh = ["dep:russh"]
-datafusion-providers = ["dep:datafusion", "dep:clickhouse", "dep:arrow-ipc"]
+datafusion-providers = ["dep:datafusion", "dep:clickhouse", "dep:arrow-ipc", "dep:hyper-util", "dep:hyper-rustls", "dep:tower-service", "dep:http"]
 
 [dependencies]
 kyomi-connect-protocol = { workspace = true }
@@ -37,7 +37,9 @@ uuid = { workspace = true }
 futures-util = { workspace = true }
 
 # Database drivers (optional, feature-gated)
-sqlx = { workspace = true, optional = true }
+sqlx-core = { workspace = true, optional = true }
+kyomi-sqlx-postgres = { workspace = true, optional = true }
+kyomi-sqlx-mysql = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
@@ -70,6 +72,12 @@ regex = { workspace = true }
 datafusion = { workspace = true, optional = true }
 clickhouse = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
+
+# Native ClickHouse transport connector (optional).
+hyper-util = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
+tower-service = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 # HTTP mock server for testing OAuth token exchange
