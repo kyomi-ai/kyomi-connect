@@ -4,6 +4,7 @@ pub(crate) mod config_file;
 mod executor;
 mod health;
 mod service;
+mod tls;
 pub mod wizard;
 mod ws_client;
 
@@ -74,6 +75,8 @@ enum ServiceAction {
 
 #[tokio::main]
 async fn main() {
+    tls::install_crypto_provider();
+
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
