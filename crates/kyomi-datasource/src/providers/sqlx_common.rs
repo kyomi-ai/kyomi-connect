@@ -14,6 +14,7 @@
 //!   sqlx row stream through the Schema → Batch* → Complete event protocol.
 //!   Used by PostgreSQL, MySQL, and Redshift.
 
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redshift"))]
 use crate::sqlx;
 use std::time::Instant;
 
