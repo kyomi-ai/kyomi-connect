@@ -63,10 +63,12 @@ pub const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Some APIs (notably Snowflake) reject requests without a User-Agent.
 /// All HTTP clients in this crate should use this function.
 pub fn http_client() -> kyomi_connect_protocol::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent("Kyomi/1.0")
-        .build()
-        .map_err(|e| {
-            kyomi_connect_protocol::Error::Internal(format!("Failed to build HTTP client: {e}"))
-        })
+    http_client_builder().build().map_err(|e| {
+        kyomi_connect_protocol::Error::Internal(format!("Failed to build HTTP client: {e}"))
+    })
+}
+
+/// Start an HTTP client with the shared User-Agent before provider-specific configuration.
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent("Kyomi/1.0")
 }
