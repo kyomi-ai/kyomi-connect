@@ -5,7 +5,6 @@ members = [
     "crates/kyomi-datasource",
 ]
 resolver = "3"
-exclude = ["crates/kyomi-sqlx-postgres", "crates/kyomi-sqlx-mysql"]
 
 # Shared dependency versions — all crates use these
 [workspace.dependencies]
@@ -15,8 +14,8 @@ tower-http = { version = "0.6", features = ["cors", "limit", "normalize-path", "
 
 # Database drivers (optional, feature-gated)
 sqlx-core = { version = "=0.8.6", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "uuid", "chrono", "json", "rust_decimal"] }
-kyomi-sqlx-postgres = { version = "=0.8.6", path = "crates/kyomi-sqlx-postgres", features = ["uuid", "chrono", "json", "rust_decimal"] }
-kyomi-sqlx-mysql = { version = "=0.8.6", path = "crates/kyomi-sqlx-mysql", features = ["uuid", "chrono", "json", "rust_decimal"] }
+sqlx-postgres = { version = "=0.8.6", features = ["uuid", "chrono", "json", "rust_decimal"] }
+sqlx-mysql = { version = "=0.8.6", features = ["uuid", "chrono", "json", "rust_decimal"] }
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 

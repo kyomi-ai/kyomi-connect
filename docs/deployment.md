@@ -244,6 +244,13 @@ kyomi-connect service uninstall
 | `DB_SSLMODE` | no | `prefer` | SSL mode (disable, prefer, require, verify-ca, verify-full) |
 | `HEALTH_PORT` | no | `9090` | Port for the health check HTTP endpoint |
 
+For PostgreSQL, MySQL and Redshift over SSH, Unix agents retain the configured
+database TLS policy and original database hostname through a local Unix socket.
+Windows agents use the encrypted SSH tunnel with database TLS disabled, regardless
+of `DB_SSLMODE`; the connection from the bastion to the database is therefore
+unencrypted. Direct Windows database connections retain their configured TLS policy.
+The backend WebSocket continues using TLS on every platform.
+
 ### TOML Config File
 
 When using the interactive setup wizard, configuration is saved to `~/.config/kyomi-connect/config.toml`:

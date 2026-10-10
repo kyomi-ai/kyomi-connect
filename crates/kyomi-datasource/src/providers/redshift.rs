@@ -137,6 +137,12 @@ impl RedshiftProvider {
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
                 let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
+                #[cfg(unix)]
+                let tunnel = {
+                    let mut tunnel = tunnel;
+                    tunnel.bind_unix_socket(port).await?;
+                    tunnel
+                };
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
@@ -164,7 +170,8 @@ impl RedshiftProvider {
 
         #[cfg(feature = "ssh")]
         if let Some(tunnel) = &ssh_tunnel {
-            connect_options = connect_options.transport_addr(tunnel.transport_addr());
+            connect_options =
+                super::postgres::configure_pg_tunnel(connect_options, tunnel, "Redshift")?;
         }
 
         // If a CA certificate path is specified, tell sqlx to use it for

@@ -13,8 +13,7 @@
 - Crate versions are independent: bump changed packages in their Cargo.toml and
   workspace dependency declarations before tagging. An existing crate version is
   immutable and will be skipped during publication.
-- `kyomi-sqlx-postgres` and `kyomi-sqlx-mysql` are maintained SQLx driver packages
-  outside the workspace. Publish them via their manifest paths before datasource.
+- Database drivers use upstream SQLx registry packages; no driver forks are published.
 
 ## Release
 
@@ -22,10 +21,6 @@
 - Tag a clean, reviewed main commit after its CI passes.
 - CI publishes crates in dependency order through crates.io trusted publishing,
   then creates the GitHub Release, Docker image, and Helm chart.
-- Before the first release using the maintained drivers, publish each new driver
-  package from the reviewed, merged source with a crates.io API token, then configure
-  its trusted publisher for this repository's `release.yml`. OIDC can only publish
-  existing crate names; the release job fails if bootstrap is incomplete.
 - Verify the GitHub Release, all Release jobs, and the exact published crate
   versions in the crates.io sparse index. Download kyomi-datasource and confirm
   the released source contains the intended fix before downstream adoption.
