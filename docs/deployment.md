@@ -272,16 +272,26 @@ The endpoint reports:
 - Whether the WebSocket connection to Kyomi Cloud is active.
 - Whether the database is reachable.
 
-Use this endpoint for Docker health checks, Kubernetes liveness/readiness probes, and monitoring.
+Use `/healthz` for readiness and dependency monitoring. It returns HTTP 200
+only while the persistent backend WebSocket is connected and the database
+connection test succeeds. Database connectivity is refreshed every 30 seconds
+with a five second timeout; the reported state can therefore lag a database
+outage by up to 35 seconds.
+
+Use `/livez` for liveness. It returns HTTP 200 while the health HTTP server is
+responsive, including during a backend or database outage. A readiness failure
+must not restart the agent: backend reconnection uses its normal backoff. When
+a WebSocket session ends, pending query tasks and replies for that session are
+cancelled so they cannot delay readiness becoming false or reconnection.
 
 ### Kubernetes Probe Example
 
-The Helm chart configures this automatically. For manual deployments:
+For manual deployments:
 
 ```yaml
 livenessProbe:
   httpGet:
-    path: /healthz
+    path: /livez
     port: 9090
   initialDelaySeconds: 10
   periodSeconds: 30

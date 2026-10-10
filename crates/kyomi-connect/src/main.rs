@@ -11,6 +11,7 @@ mod ws_client;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -306,6 +307,23 @@ async fn run_agent() {
         ws_connected.clone(),
         db_healthy.clone(),
     ));
+
+    // Keep readiness tied to current datasource connectivity, without making
+    // dependency outages a reason to restart this process.
+    let database_executor = executor.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            health::refresh_database_readiness(
+                &db_healthy,
+                Duration::from_secs(5),
+                database_executor.database_reachable(),
+            )
+            .await;
+        }
+    });
 
     // 5. Run forever (reconnects automatically on disconnection)
     ws_client

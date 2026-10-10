@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite;
 
 use kyomi_connect_protocol::wire::{ConnectRequest, ConnectResponse};
@@ -146,14 +147,24 @@ impl WsClient {
         let (write_tx, write_rx) = mpsc::channel::<tungstenite::Message>(64);
 
         // Spawn the writer task (owns ws_sender)
-        let writer_handle = tokio::spawn(writer_task(ws_sender, write_rx));
+        let mut writer_handle = tokio::spawn(writer_task(ws_sender, write_rx));
+        let mut requests = JoinSet::new();
 
         // Reader loop: deserialize requests and spawn handler tasks.
         // Each recv is wrapped in a timeout — if the server goes silent
         // (dead TCP, pod replaced, network partition), we detect it and
         // return so run_forever can reconnect.
         loop {
-            let msg = match tokio::time::timeout(SILENCE_TIMEOUT, ws_receiver.next()).await {
+            while let Some(result) = requests.try_join_next() {
+                if result.is_err() {
+                    tracing::warn!("Session query task failed");
+                }
+            }
+            let received = tokio::select! {
+                _ = &mut writer_handle => break,
+                received = tokio::time::timeout(SILENCE_TIMEOUT, ws_receiver.next()) => received,
+            };
+            let msg = match received {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
                     // Stream ended (server closed cleanly)
@@ -183,7 +194,7 @@ impl WsClient {
                     let write_tx = write_tx.clone();
                     let handler = handler.clone();
 
-                    tokio::spawn(async move {
+                    requests.spawn(async move {
                         let responses = handler(request).await;
                         for response in responses {
                             let json = match serde_json::to_string(&response) {
@@ -210,11 +221,9 @@ impl WsClient {
                     });
                 }
                 Ok(tungstenite::Message::Ping(data)) => {
-                    if write_tx
-                        .send(tungstenite::Message::Pong(data))
-                        .await
-                        .is_err()
-                    {
+                    // A full queue means responses/socket writes are stalled.
+                    // Never let a heartbeat block disconnect detection.
+                    if !enqueue_pong(&write_tx, data) {
                         break;
                     }
                 }
@@ -230,10 +239,16 @@ impl WsClient {
             }
         }
 
-        // Drop the sender so the writer task exits
+        // A request can retain a sender indefinitely, and a socket write can
+        // block. Cancel session work instead of delaying readiness/reconnect.
+        requests.abort_all();
+        writer_handle.abort();
         drop(write_tx);
-        let _ = writer_handle.await;
     }
+}
+
+fn enqueue_pong(tx: &mpsc::Sender<tungstenite::Message>, data: tungstenite::Bytes) -> bool {
+    tx.try_send(tungstenite::Message::Pong(data)).is_ok()
 }
 
 /// Writer task: drains the mpsc channel and sends messages over the WebSocket.
@@ -264,6 +279,26 @@ fn extract_host(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn heartbeat_backpressure_ends_session_instead_of_waiting() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(tungstenite::Message::Text("blocked response".into()))
+            .await
+            .unwrap();
+        assert!(!enqueue_pong(&tx, vec![1].into()));
+        assert!(matches!(
+            rx.recv().await,
+            Some(tungstenite::Message::Text(_))
+        ));
+        assert!(enqueue_pong(&tx, vec![2].into()));
+        assert!(matches!(
+            rx.recv().await,
+            Some(tungstenite::Message::Pong(_))
+        ));
+        drop(rx);
+        assert!(!enqueue_pong(&tx, vec![3].into()));
+    }
 
     #[test]
     fn extract_host_wss() {

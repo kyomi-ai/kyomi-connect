@@ -85,6 +85,11 @@ impl CommandExecutor {
         }
     }
 
+    /// Test current datasource connectivity for readiness monitoring.
+    pub async fn database_reachable(&self) -> anyhow::Result<bool> {
+        Ok(self.provider.test_connection().await?)
+    }
+
     async fn handle_test_connection(&self) -> anyhow::Result<serde_json::Value> {
         let ok = self
             .provider

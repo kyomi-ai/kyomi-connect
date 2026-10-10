@@ -73,7 +73,10 @@ Once running, you can check the health of the connection:
 curl http://localhost:9090/healthz
 ```
 
-Returns `{"status":"ok"}` when connected, or details about what's unhealthy.
+Returns HTTP 200 with `status: "healthy"` when the backend WebSocket and
+database are reachable, or HTTP 503 with the corresponding connectivity flags.
+Use `/healthz` for readiness and `/livez` for liveness; dependency outages keep
+`/livez` healthy so normal backend reconnection can continue.
 
 ## Monitoring
 
