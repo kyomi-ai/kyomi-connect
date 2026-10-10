@@ -11,8 +11,8 @@ homepage = "https://kyomi.ai"
 default = ["all"]
 all = ["postgres", "mysql", "redshift", "clickhouse", "snowflake",
        "databricks", "sqlserver", "synapse", "bigquery", "flaredb", "ssh"]
-postgres = ["dep:sqlx-core", "dep:kyomi-sqlx-postgres"]
-mysql = ["dep:sqlx-core", "dep:kyomi-sqlx-mysql"]
+postgres = ["dep:sqlx-core", "dep:sqlx-postgres"]
+mysql = ["dep:sqlx-core", "dep:sqlx-mysql"]
 redshift = ["postgres"]
 clickhouse = []
 snowflake = ["dep:jsonwebtoken", "dep:rsa"]
@@ -38,8 +38,8 @@ futures-util = { workspace = true }
 
 # Database drivers (optional, feature-gated)
 sqlx-core = { workspace = true, optional = true }
-kyomi-sqlx-postgres = { workspace = true, optional = true }
-kyomi-sqlx-mysql = { workspace = true, optional = true }
+sqlx-postgres = { workspace = true, optional = true }
+sqlx-mysql = { workspace = true, optional = true }
 tiberius = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }

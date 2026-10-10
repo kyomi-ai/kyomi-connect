@@ -1,4 +1,4 @@
-//! Shared upstream SQLx API with the portable transport driver extensions.
+//! Shared upstream SQLx API used by datasource providers.
 pub use sqlx_core::column::Column;
 #[cfg(all(test, feature = "ssh"))]
 pub use sqlx_core::connection::Connection;

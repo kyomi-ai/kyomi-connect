@@ -220,7 +220,7 @@ These values are read by the agent process and used to establish direct connecti
 
 The WebSocket connection to Kyomi Cloud uses TLS (wss://). Data in transit between the agent and Kyomi Cloud is encrypted.
 
-The connection between the agent and the local database uses the database's native protocol and can optionally use SSL/TLS (configured via `DB_SSLMODE`).
+The connection between the agent and the local database uses the database's native protocol and can optionally use SSL/TLS (configured via `DB_SSLMODE`). PostgreSQL, MySQL and Redshift SSH connections on Windows disable database TLS and rely on SSH encryption between the agent and bastion; the bastion-to-database hop is unencrypted. Unix SSH and direct Windows connections retain the configured database TLS policy.
 
 ## Reconnection
 

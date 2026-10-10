@@ -111,6 +111,12 @@ impl MySqlProvider {
         let ssh_tunnel = match SshTunnelConfig::from_connection_config(connection_config) {
             Some(Ok(ssh_config)) => {
                 let tunnel = SshTunnel::connect(&ssh_config, &host, port).await?;
+                #[cfg(unix)]
+                let tunnel = {
+                    let mut tunnel = tunnel;
+                    tunnel.bind_unix_socket(port).await?;
+                    tunnel
+                };
                 Some(tunnel)
             }
             Some(Err(e)) => return Err(e),
@@ -138,7 +144,7 @@ impl MySqlProvider {
 
         #[cfg(feature = "ssh")]
         if let Some(tunnel) = &ssh_tunnel {
-            connect_options = connect_options.transport_addr(tunnel.transport_addr());
+            connect_options = configure_mysql_tunnel(connect_options, tunnel)?;
         }
 
         // For verify-ca / verify-full, attach the CA certificate if provided
@@ -429,6 +435,36 @@ impl DatasourceProvider for MySqlProvider {
         self.pool.close().await;
         tracing::debug!("MySQL connection pool closed");
     }
+}
+
+/// Route upstream SQLx through SSH using the platform's supported transport.
+#[cfg(feature = "ssh")]
+pub(crate) fn configure_mysql_tunnel(
+    mut connect_options: MySqlConnectOptions,
+    tunnel: &SshTunnel,
+) -> kyomi_connect_protocol::Result<MySqlConnectOptions> {
+    #[cfg(unix)]
+    {
+        // Retain the database hostname for TLS while dialing the SSH relay.
+        let socket = tunnel
+            .unix_socket_path()
+            .ok_or_else(|| Error::Internal("MySQL SSH tunnel socket is unavailable".into()))?;
+        connect_options = connect_options.socket(socket);
+    }
+
+    #[cfg(windows)]
+    {
+        // Upstream SQLx cannot separate the TCP endpoint from its TLS host.
+        // SSH encrypts the bastion leg; database TLS is disabled on Windows.
+        let endpoint = tunnel.transport_addr();
+        connect_options = connect_options
+            .host(&endpoint.ip().to_string())
+            .port(endpoint.port())
+            .ssl_mode(MySqlSslMode::Disabled);
+        tracing::warn!("MySQL database TLS is disabled for SSH connections on Windows");
+    }
+
+    Ok(connect_options)
 }
 
 // ---------------------------------------------------------------------------

@@ -195,9 +195,9 @@ impl SshTunnel {
         })
     }
 
-    /// Provide a PostgreSQL-compatible Unix socket for existing Unix callers.
-    /// The socket relays through this tunnel while the driver retains its TLS host.
-    /// Portable datasource providers use [`Self::transport_addr`] instead.
+    /// Provide a Unix socket that relays through this tunnel.
+    /// PostgreSQL, Redshift, and MySQL drivers use this on Unix while retaining
+    /// the database hostname and configured TLS verification mode.
     #[cfg(unix)]
     pub async fn bind_unix_socket(
         &mut self,
@@ -1077,7 +1077,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         );
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(unix, feature = "postgres"))]
     async fn postgres_tls_handshake(host: &str, trusted: bool) -> (bool, String) {
         use crate::sqlx::Connection;
         use crate::sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
@@ -1108,7 +1108,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             tcp.write_all(b"S").await.unwrap();
             tls.accept(tcp).await.is_ok()
         });
-        let tunnel = SshTunnel {
+        let mut tunnel = SshTunnel {
             local_addr: addr,
             shutdown: Arc::new(Notify::new()),
             task_handle: None,
@@ -1117,16 +1117,19 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             #[cfg(unix)]
             unix_socket: None,
         };
+        tunnel.bind_unix_socket(5432).await.unwrap();
         let mut options = PgConnectOptions::new()
             .host(host)
             .port(5432)
-            .transport_addr(tunnel.transport_addr())
             .username("test")
             .database("test")
             .ssl_mode(PgSslMode::VerifyFull);
         if trusted {
             options = options.ssl_root_cert(format!("{fixture}db.cert.pem"));
         }
+        let options =
+            crate::providers::postgres::configure_pg_tunnel(options, &tunnel, "PostgreSQL")
+                .unwrap();
         let client = PgConnection::connect_with(&options);
         let (client_result, server_result) =
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1138,7 +1141,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         (server_result.unwrap(), error.to_string())
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(unix, feature = "postgres"))]
     #[tokio::test]
     async fn postgres_tls_over_tunnel_validates_database_certificate_and_hostname() {
         let (accepted, error) = postgres_tls_handshake("db.example.test", true).await;
@@ -1149,6 +1152,94 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         let (accepted, error) = postgres_tls_handshake("db.example.test", false).await;
         assert!(!accepted);
         assert!(error.contains("UnknownIssuer"), "{error}");
+    }
+
+    #[cfg(all(windows, feature = "postgres"))]
+    #[tokio::test]
+    async fn windows_postgres_ssh_uses_plaintext_database_startup() {
+        use crate::sqlx::{
+            Connection,
+            postgres::{PgConnectOptions, PgConnection, PgSslMode},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tunnel = test_tunnel(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut header = [0; 8];
+            tcp.read_exact(&mut header).await.unwrap();
+            assert_eq!(
+                &header[4..],
+                &[0, 3, 0, 0],
+                "expected plaintext PostgreSQL startup, not SSLRequest"
+            );
+        });
+        let options = crate::providers::postgres::configure_pg_tunnel(
+            PgConnectOptions::new()
+                .host("db.example.test")
+                .port(5432)
+                .username("test")
+                .database("test")
+                .ssl_mode(PgSslMode::VerifyFull),
+            &tunnel,
+            "PostgreSQL",
+        )
+        .unwrap();
+        let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(PgConnection::connect_with(&options), server)
+        })
+        .await
+        .expect("Windows PostgreSQL tunnel handshake timed out");
+        observed.unwrap();
+        assert!(result.is_err(), "mock server closes before login completes");
+    }
+
+    #[cfg(all(windows, feature = "mysql"))]
+    #[tokio::test]
+    async fn windows_mysql_ssh_uses_plaintext_database_handshake() {
+        use crate::sqlx::{
+            Connection,
+            mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tunnel = test_tunnel(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let greeting = b"\n8.0.18\x00\x19\x00\x00\x00\x114aB0c\x06g\x00\xff\xff\xff\x02\x00\xff\xc7\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00tL\x03s\x0f[4\rl4. \x00caching_sha2_password\x00";
+            let mut packet = (greeting.len() as u32).to_le_bytes().to_vec();
+            packet[3] = 0;
+            packet.extend_from_slice(greeting);
+            tcp.write_all(&packet).await.unwrap();
+            let mut header = [0; 4];
+            tcp.read_exact(&mut header).await.unwrap();
+            let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+            assert!(
+                length > 32,
+                "expected full login packet, not TLS upgrade request"
+            );
+            let mut response = vec![0; length];
+            tcp.read_exact(&mut response).await.unwrap();
+            assert_eq!(
+                u32::from_le_bytes(response[..4].try_into().unwrap()) & 0x800,
+                0,
+                "CLIENT_SSL must be disabled for Windows SSH database connections"
+            );
+        });
+        let options = crate::providers::mysql::configure_mysql_tunnel(
+            MySqlConnectOptions::new()
+                .host("db.example.test")
+                .port(3306)
+                .username("test")
+                .ssl_mode(MySqlSslMode::VerifyIdentity),
+            &tunnel,
+        )
+        .unwrap();
+        let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(MySqlConnection::connect_with(&options), server)
+        })
+        .await
+        .expect("Windows MySQL tunnel handshake timed out");
+        observed.unwrap();
+        assert!(result.is_err(), "mock server closes before login completes");
     }
 
     fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
@@ -1182,7 +1273,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         }
     }
 
-    #[cfg(feature = "mysql")]
+    #[cfg(all(unix, feature = "mysql"))]
     async fn mysql_tls_handshake(
         host: &str,
         trusted: bool,
@@ -1215,11 +1306,11 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
             );
             tls.accept(tcp).await.is_ok()
         });
-        let tunnel = test_tunnel(addr);
+        let mut tunnel = test_tunnel(addr);
+        tunnel.bind_unix_socket(3306).await.unwrap();
         let mut options = MySqlConnectOptions::new()
             .host(host)
             .port(3306)
-            .transport_addr(tunnel.transport_addr())
             .username("test")
             .ssl_mode(mode);
         if trusted {
@@ -1228,6 +1319,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
                 "/tests/fixtures/tls/db.cert.pem"
             ));
         }
+        let options = crate::providers::mysql::configure_mysql_tunnel(options, &tunnel).unwrap();
         let (result, accepted) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(MySqlConnection::connect_with(&options), server)
         })
@@ -1241,7 +1333,7 @@ bQP0o+gL5aKK8cQgiIlXeDbRjqhc4+h4EF6lY=\n\
         )
     }
 
-    #[cfg(feature = "mysql")]
+    #[cfg(all(unix, feature = "mysql"))]
     #[tokio::test]
     async fn mysql_tls_over_tunnel_preserves_identity_and_configured_modes() {
         use crate::sqlx::mysql::MySqlSslMode;

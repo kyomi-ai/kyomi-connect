@@ -173,10 +173,6 @@ jobs:
 
           # Publish in dependency order
           publish_if_new kyomi-connect-protocol
-          # New driver names must first be bootstrapped with a crates.io API token
-          # and configured to trust this workflow; OIDC cannot create a new crate.
-          publish_if_new kyomi-sqlx-postgres
-          publish_if_new kyomi-sqlx-mysql
           publish_if_new kyomi-datasource
           publish_if_new kyomi-connect
         env:
